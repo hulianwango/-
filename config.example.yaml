@@ -1,0 +1,20 @@
+app:
+  host: "127.0.0.1"
+  port: 8000
+
+paths:
+  papers_dir: "papers"
+  database: "data/library.db"
+  logs_dir: "logs"
+
+mcp:
+  bearer_token: "change-me-before-exposing"
+  rate_limit_per_minute: 60
+  max_search_limit: 10
+  max_chunks_per_request: 5
+  max_response_chars: 6000
+
+index:
+  chunk_size: 1800
+  chunk_overlap: 250
+
