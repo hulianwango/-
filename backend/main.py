@@ -10,6 +10,7 @@ from .config import PROJECT_ROOT
 from .database import connect
 from .local_api import router as local_router
 from .mcp_api import router as mcp_router
+from .oauth_api import router as oauth_router
 
 
 app = FastAPI(
@@ -22,6 +23,7 @@ app = FastAPI(
 )
 
 app.include_router(local_router)
+app.include_router(oauth_router)
 app.include_router(mcp_router)
 
 FRONTEND_DIR = PROJECT_ROOT / "frontend"

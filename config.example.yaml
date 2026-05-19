@@ -9,12 +9,20 @@ paths:
 
 mcp:
   bearer_token: "change-me-before-exposing"
+  require_auth: true
   rate_limit_per_minute: 60
   max_search_limit: 10
   max_chunks_per_request: 5
   max_response_chars: 6000
 
+oauth:
+  enabled: true
+  public_base_url: "https://literature.example.com"
+  username: "change-me"
+  password_hash: "$2b$12$replace-with-bcrypt-hash"
+  token_expires_seconds: 43200
+  code_expires_seconds: 600
+
 index:
   chunk_size: 1800
   chunk_overlap: 250
-

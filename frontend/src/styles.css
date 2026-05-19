@@ -99,6 +99,20 @@ button:disabled {
   padding: 8px;
 }
 
+.libraryMeta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #d9dfdc;
+  color: #40514a;
+  font-size: 12px;
+}
+
+.libraryMeta strong {
+  color: #17201d;
+}
+
 .paperRow {
   width: 100%;
   display: grid;
@@ -210,6 +224,210 @@ canvas {
   flex-direction: column;
 }
 
+.paperOverview {
+  min-height: 0;
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.overviewHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid #d8dee2;
+}
+
+.overviewHeader h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.overviewHeader p {
+  margin: 4px 0 0;
+  color: #40514a;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.overviewBody {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.overviewBlock {
+  padding: 12px 0;
+  border-bottom: 1px solid #e0e5e2;
+}
+
+.overviewBlock:first-child {
+  padding-top: 0;
+}
+
+.overviewBlock:last-child {
+  border-bottom: 0;
+}
+
+.overviewBlock h3 {
+  margin: 0 0 8px;
+  color: #17201d;
+  font-size: 13px;
+}
+
+.bilingualLabel {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.bilingualLabel small {
+  color: #6a7770;
+  font-size: 0.82em;
+  font-weight: 500;
+}
+
+.metaGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 0;
+}
+
+.metaGrid div {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid #d5dcd8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.metaGrid dt {
+  margin: 0 0 4px;
+  color: #6a7770;
+  font-size: 11px;
+}
+
+.metaGrid dt .bilingualLabel {
+  display: grid;
+  gap: 1px;
+}
+
+.metaGrid dt .bilingualLabel small {
+  font-size: 10px;
+}
+
+.metaGrid dd {
+  margin: 0;
+  color: #17201d;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.summaryText,
+.summaryNotice {
+  margin: 0;
+  color: #2b3733;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.summaryNotice {
+  padding: 10px;
+  border: 1px solid #d7c8a4;
+  border-radius: 8px;
+  background: #fff8e7;
+  color: #694e13;
+}
+
+.originalText {
+  color: #3d4c46;
+}
+
+.languagePair {
+  display: grid;
+  gap: 10px;
+}
+
+.languagePanel {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #d5dcd8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.languagePanel strong,
+.pointLanguage strong {
+  display: block;
+  margin-bottom: 5px;
+  color: #5c6a63;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.languagePanel .summaryText,
+.languagePanel .summaryNotice {
+  margin: 0;
+}
+
+.mainPointList {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mainPointList li {
+  padding: 9px 10px;
+  border: 1px solid #d5dcd8;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #2b3733;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.bilingualPointList li {
+  display: grid;
+  gap: 8px;
+}
+
+.pointLanguage p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.pointLanguage + .pointLanguage {
+  padding-top: 8px;
+  border-top: 1px solid #e4e9e6;
+}
+
+.headingList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.headingList span {
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid #cbd8d2;
+  border-radius: 999px;
+  background: #eef5f2;
+  color: #334640;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .draftTabs {
   display: flex;
   gap: 6px;
@@ -235,8 +453,10 @@ canvas {
 
 .draftPanel {
   min-height: 0;
+  flex: 0 1 48%;
   display: flex;
   flex-direction: column;
+  border-top: 1px solid #d8dee2;
 }
 
 .draftHeader {

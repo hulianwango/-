@@ -51,6 +51,22 @@ def _resolve_path(value: str | os.PathLike[str]) -> Path:
     return PROJECT_ROOT / path
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 @dataclass(frozen=True)
 class Settings:
     app_host: str
@@ -59,10 +75,17 @@ class Settings:
     database_path: Path
     logs_dir: Path
     mcp_bearer_token: str
+    mcp_require_auth: bool
     rate_limit_per_minute: int
     max_search_limit: int
     max_chunks_per_request: int
     max_response_chars: int
+    oauth_enabled: bool
+    oauth_public_base_url: str
+    oauth_username: str
+    oauth_password_hash: str
+    oauth_token_expires_seconds: int
+    oauth_code_expires_seconds: int
     chunk_size: int
     chunk_overlap: int
 
@@ -96,14 +119,41 @@ def load_settings() -> Settings:
             merged_env.get("MCP_BEARER_TOKEN")
             or _deep_get(config, "mcp.bearer_token", "")
         ),
+        mcp_require_auth=_as_bool(
+            merged_env.get("MCP_REQUIRE_AUTH"),
+            _as_bool(_deep_get(config, "mcp.require_auth", True), True),
+        ),
         rate_limit_per_minute=int(_deep_get(config, "mcp.rate_limit_per_minute", 60)),
         max_search_limit=int(_deep_get(config, "mcp.max_search_limit", 10)),
         max_chunks_per_request=int(_deep_get(config, "mcp.max_chunks_per_request", 5)),
         max_response_chars=int(_deep_get(config, "mcp.max_response_chars", 6000)),
+        oauth_enabled=_as_bool(
+            merged_env.get("OAUTH_ENABLED"),
+            _as_bool(_deep_get(config, "oauth.enabled", True), True),
+        ),
+        oauth_public_base_url=str(
+            merged_env.get("OAUTH_PUBLIC_BASE_URL")
+            or _deep_get(config, "oauth.public_base_url", "")
+        ).rstrip("/"),
+        oauth_username=str(
+            merged_env.get("OAUTH_USERNAME")
+            or _deep_get(config, "oauth.username", "")
+        ),
+        oauth_password_hash=str(
+            merged_env.get("OAUTH_PASSWORD_HASH")
+            or _deep_get(config, "oauth.password_hash", "")
+        ),
+        oauth_token_expires_seconds=int(
+            merged_env.get("OAUTH_TOKEN_EXPIRES_SECONDS")
+            or _deep_get(config, "oauth.token_expires_seconds", 43200)
+        ),
+        oauth_code_expires_seconds=int(
+            merged_env.get("OAUTH_CODE_EXPIRES_SECONDS")
+            or _deep_get(config, "oauth.code_expires_seconds", 600)
+        ),
         chunk_size=int(_deep_get(config, "index.chunk_size", 1800)),
         chunk_overlap=int(_deep_get(config, "index.chunk_overlap", 250)),
     )
 
 
 settings = load_settings()
-

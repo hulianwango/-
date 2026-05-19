@@ -1,0 +1,7 @@
+tunnel: <your-tunnel-uuid>
+credentials-file: 'C:\Users\<your-user>\.cloudflared\<your-tunnel-uuid>.json'
+
+ingress:
+  - hostname: literature.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404

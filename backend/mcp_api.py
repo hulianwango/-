@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field, ValidationError
 
 from . import mcp_tools
-from .security import log_mcp_event, require_mcp_access, scrub_public_payload
+from .oauth_store import READ_SCOPE, WRITE_DRAFT_SCOPE
+from .security import (
+    AuthContext,
+    log_mcp_event,
+    log_mcp_rpc_event,
+    require_mcp_access,
+    require_mcp_scopes,
+    scrub_public_payload,
+)
 
 
-router = APIRouter(prefix="/mcp", dependencies=[Depends(require_mcp_access)])
+router = APIRouter()
 
 
 class SearchPapersRequest(BaseModel):
-    query: str
-    limit: int = Field(default=10, ge=1, le=10)
+    query: str = Field(min_length=1, description="Search query")
+    limit: int = Field(default=5, ge=1, le=10)
 
 
 class MetadataRequest(BaseModel):
@@ -24,7 +34,7 @@ class MetadataRequest(BaseModel):
 
 class ReadChunksRequest(BaseModel):
     paper_id: str
-    chunk_ids: list[str] = Field(default_factory=list, max_length=5)
+    chunk_ids: list[str] = Field(min_length=1, max_length=5)
 
 
 class ReadPageRequest(BaseModel):
@@ -42,174 +52,169 @@ class UpdateDraftRequest(BaseModel):
     annotation_json: dict[str, Any]
 
 
-def _tools() -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "search_papers",
-            "description": "Search indexed PDF text chunks. Empty query is rejected.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "minLength": 1},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-                },
-                "required": ["query"],
-            },
-        },
-        {
-            "name": "get_paper_metadata",
-            "description": "Return safe paper metadata by paper_id.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"paper_id": {"type": "string"}},
-                "required": ["paper_id"],
-            },
-        },
-        {
-            "name": "read_text_chunks",
-            "description": "Read up to five indexed text chunks for one paper.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "paper_id": {"type": "string"},
-                    "chunk_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 5,
-                    },
-                },
-                "required": ["paper_id", "chunk_ids"],
-            },
-        },
-        {
-            "name": "read_page_text",
-            "description": "Read one page of extracted text for one paper.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "paper_id": {"type": "string"},
-                    "page_number": {"type": "integer", "minimum": 1},
-                },
-                "required": ["paper_id", "page_number"],
-            },
-        },
-        {
-            "name": "save_annotation_draft",
-            "description": "Save an AI annotation draft for local human review only.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "paper_id": {"type": "string"},
-                    "annotation_json": {"type": "object"},
-                },
-                "required": ["paper_id", "annotation_json"],
-            },
-        },
-        {
-            "name": "update_annotation_draft",
-            "description": "Update a pending AI annotation draft only.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "draft_id": {"type": "string"},
-                    "annotation_json": {"type": "object"},
-                },
-                "required": ["draft_id", "annotation_json"],
-            },
-        },
-    ]
+@dataclass(frozen=True)
+class ToolDefinition:
+    description: str
+    request_model: type[BaseModel]
+    scopes: set[str]
+    handler: Callable[[BaseModel], Any]
 
 
-TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Any]] = {
-    "search_papers": lambda args: mcp_tools.search_papers(
-        query=str(args.get("query", "")),
-        limit=int(args.get("limit", 10)),
+def _call_search_papers(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.search_papers(query=data["query"], limit=data["limit"])
+
+
+def _call_get_paper_metadata(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.get_paper_metadata(paper_id=data["paper_id"])
+
+
+def _call_read_text_chunks(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.read_text_chunks(paper_id=data["paper_id"], chunk_ids=data["chunk_ids"])
+
+
+def _call_read_page_text(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.read_page_text(paper_id=data["paper_id"], page_number=data["page_number"])
+
+
+def _call_save_annotation_draft(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.save_annotation_draft(
+        paper_id=data["paper_id"],
+        annotation_json=data["annotation_json"],
+    )
+
+
+def _call_update_annotation_draft(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.update_annotation_draft(
+        draft_id=data["draft_id"],
+        annotation_json=data["annotation_json"],
+    )
+
+
+TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
+    "search_papers": ToolDefinition(
+        description="Search the private literature database and return limited matching paper snippets.",
+        request_model=SearchPapersRequest,
+        scopes={READ_SCOPE},
+        handler=_call_search_papers,
     ),
-    "get_paper_metadata": lambda args: mcp_tools.get_paper_metadata(
-        paper_id=str(args.get("paper_id", ""))
+    "get_paper_metadata": ToolDefinition(
+        description="Get safe metadata for one paper without exposing file paths or PDFs.",
+        request_model=MetadataRequest,
+        scopes={READ_SCOPE},
+        handler=_call_get_paper_metadata,
     ),
-    "read_text_chunks": lambda args: mcp_tools.read_text_chunks(
-        paper_id=str(args.get("paper_id", "")),
-        chunk_ids=list(args.get("chunk_ids") or []),
+    "read_text_chunks": ToolDefinition(
+        description="Read limited original text chunks from a paper by chunk ids.",
+        request_model=ReadChunksRequest,
+        scopes={READ_SCOPE},
+        handler=_call_read_text_chunks,
     ),
-    "read_page_text": lambda args: mcp_tools.read_page_text(
-        paper_id=str(args.get("paper_id", "")),
-        page_number=int(args.get("page_number", 0)),
+    "read_page_text": ToolDefinition(
+        description="Read limited extracted text from one page of a paper.",
+        request_model=ReadPageRequest,
+        scopes={READ_SCOPE},
+        handler=_call_read_page_text,
     ),
-    "save_annotation_draft": lambda args: mcp_tools.save_annotation_draft(
-        paper_id=str(args.get("paper_id", "")),
-        annotation_json=dict(args.get("annotation_json") or {}),
+    "save_annotation_draft": ToolDefinition(
+        description="Save AI-generated paper annotation as a pending draft only. Does not approve or write formal annotations.",
+        request_model=SaveDraftRequest,
+        scopes={WRITE_DRAFT_SCOPE},
+        handler=_call_save_annotation_draft,
     ),
-    "update_annotation_draft": lambda args: mcp_tools.update_annotation_draft(
-        draft_id=str(args.get("draft_id", "")),
-        annotation_json=dict(args.get("annotation_json") or {}),
+    "update_annotation_draft": ToolDefinition(
+        description="Update an existing pending AI annotation draft.",
+        request_model=UpdateDraftRequest,
+        scopes={WRITE_DRAFT_SCOPE},
+        handler=_call_update_annotation_draft,
     ),
 }
 
 
-def call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
-    if tool_name not in TOOL_HANDLERS:
+def _input_schema(model: type[BaseModel]) -> dict[str, Any]:
+    schema = model.model_json_schema()
+    schema.pop("title", None)
+    return schema
+
+
+def _tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "description": definition.description,
+            "inputSchema": _input_schema(definition.request_model),
+        }
+        for name, definition in TOOL_DEFINITIONS.items()
+    ]
+
+
+def call_tool(tool_name: str, arguments: dict[str, Any], auth: AuthContext | None = None) -> Any:
+    definition = TOOL_DEFINITIONS.get(tool_name)
+    if definition is None:
         log_mcp_event(tool_name, 404)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="tool not found.")
     try:
-        result = TOOL_HANDLERS[tool_name](arguments)
+        if auth is not None:
+            require_mcp_scopes(auth, definition.scopes)
+        payload = definition.request_model.model_validate(arguments)
+        result = definition.handler(payload)
         log_mcp_event(
             tool_name,
             200,
             {
-                "paper_id": arguments.get("paper_id"),
-                "chunk_count": len(arguments.get("chunk_ids") or []),
-                "query_len": len(str(arguments.get("query") or "")),
+                "paper_id": getattr(payload, "paper_id", None),
+                "chunk_count": len(getattr(payload, "chunk_ids", []) or []),
+                "query_len": len(str(getattr(payload, "query", "") or "")),
             },
         )
         return scrub_public_payload(result)
+    except ValidationError as exc:
+        log_mcp_event(tool_name, status.HTTP_400_BAD_REQUEST)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid tool arguments.",
+        ) from exc
     except HTTPException as exc:
         log_mcp_event(tool_name, exc.status_code)
         raise
 
 
-@router.get("/tools")
-def list_tools() -> dict[str, Any]:
-    return {"tools": _tools()}
+def _json_rpc_error(rpc_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
 
 
-@router.post("/tools/search_papers")
-def rest_search_papers(payload: SearchPapersRequest) -> Any:
-    return call_tool("search_papers", payload.model_dump())
+def _json_rpc_success(rpc_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
 
 
-@router.post("/tools/get_paper_metadata")
-def rest_get_paper_metadata(payload: MetadataRequest) -> Any:
-    return call_tool("get_paper_metadata", payload.model_dump())
+def _handle_json_rpc_message(payload: Any, auth: AuthContext) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        log_mcp_rpc_event("invalid", False, 200, {"error": "invalid_request"})
+        return _json_rpc_error(None, -32600, "Invalid Request")
 
-
-@router.post("/tools/read_text_chunks")
-def rest_read_text_chunks(payload: ReadChunksRequest) -> Any:
-    return call_tool("read_text_chunks", payload.model_dump())
-
-
-@router.post("/tools/read_page_text")
-def rest_read_page_text(payload: ReadPageRequest) -> Any:
-    return call_tool("read_page_text", payload.model_dump())
-
-
-@router.post("/tools/save_annotation_draft")
-def rest_save_annotation_draft(payload: SaveDraftRequest) -> Any:
-    return call_tool("save_annotation_draft", payload.model_dump())
-
-
-@router.post("/tools/update_annotation_draft")
-def rest_update_annotation_draft(payload: UpdateDraftRequest) -> Any:
-    return call_tool("update_annotation_draft", payload.model_dump())
-
-
-@router.post("")
-@router.post("/")
-async def mcp_json_rpc(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    has_id = "id" in payload
     rpc_id = payload.get("id")
-    method = payload.get("method")
-    params = payload.get("params") or {}
+    method = str(payload.get("method") or "")
+    raw_params = payload.get("params") or {}
+    params = raw_params if isinstance(raw_params, dict) else {}
+
+    if not method:
+        log_mcp_rpc_event(method, has_id, 200, {"error": "missing_method"})
+        if has_id:
+            return _json_rpc_error(rpc_id, -32600, "Invalid Request")
+        return None
 
     try:
         if method == "initialize":
@@ -218,12 +223,20 @@ async def mcp_json_rpc(payload: dict[str, Any], request: Request) -> dict[str, A
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "private-literature-mcp", "version": "0.1.0"},
             }
+        elif method == "ping":
+            result = {}
         elif method == "tools/list":
             result = {"tools": _tools()}
         elif method == "tools/call":
+            if not isinstance(raw_params, dict):
+                log_mcp_rpc_event(method, has_id, 200, {"error": "invalid_params"})
+                return _json_rpc_error(rpc_id, -32602, "Invalid params")
             tool_name = str(params.get("name") or "")
-            arguments = dict(params.get("arguments") or {})
-            tool_result = call_tool(tool_name, arguments)
+            arguments = params.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                log_mcp_rpc_event(method, has_id, 200, {"error": "invalid_arguments"})
+                return _json_rpc_error(rpc_id, -32602, "Invalid params")
+            tool_result = call_tool(tool_name, arguments, auth)
             result = {
                 "content": [
                     {
@@ -234,14 +247,119 @@ async def mcp_json_rpc(payload: dict[str, Any], request: Request) -> dict[str, A
                 "isError": False,
             }
         elif method == "notifications/initialized":
-            result = {}
+            log_mcp_rpc_event(method, has_id, 200)
+            if has_id:
+                return _json_rpc_success(rpc_id, {})
+            return {"jsonrpc": "2.0", "result": {}}
         else:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="method not found.")
-        return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
-    except HTTPException as exc:
-        return {
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "error": {"code": exc.status_code, "message": str(exc.detail)},
-        }
+            log_mcp_rpc_event(method, has_id, 200, {"unknown": True})
+            if has_id:
+                return _json_rpc_error(rpc_id, -32601, "Method not found")
+            return None
 
+        log_mcp_rpc_event(method, has_id, 200)
+        if has_id:
+            return _json_rpc_success(rpc_id, result)
+        return None
+    except HTTPException as exc:
+        log_mcp_rpc_event(method, has_id, 200, {"tool_status": exc.status_code})
+        code = -32602 if exc.status_code == status.HTTP_400_BAD_REQUEST else -32000
+        return _json_rpc_error(rpc_id, code, str(exc.detail))
+
+
+@router.get("/mcp/tools")
+def list_tools(auth: AuthContext = Depends(require_mcp_access)) -> dict[str, Any]:
+    _ = auth
+    return {"tools": _tools()}
+
+
+@router.get("/mcp")
+@router.get("/mcp/")
+@router.head("/mcp")
+@router.head("/mcp/")
+def mcp_probe(auth: AuthContext = Depends(require_mcp_access)) -> JSONResponse:
+    _ = auth
+    return JSONResponse(
+        {"detail": "Use POST /mcp for MCP JSON-RPC."},
+        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+    )
+
+
+@router.post("/mcp/tools/search_papers")
+def rest_search_papers(
+    payload: SearchPapersRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("search_papers", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/get_paper_metadata")
+def rest_get_paper_metadata(
+    payload: MetadataRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("get_paper_metadata", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/read_text_chunks")
+def rest_read_text_chunks(
+    payload: ReadChunksRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("read_text_chunks", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/read_page_text")
+def rest_read_page_text(
+    payload: ReadPageRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("read_page_text", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/save_annotation_draft")
+def rest_save_annotation_draft(
+    payload: SaveDraftRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("save_annotation_draft", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/update_annotation_draft")
+def rest_update_annotation_draft(
+    payload: UpdateDraftRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("update_annotation_draft", payload.model_dump(), auth)
+
+
+@router.post("/", response_model=None)
+@router.post("/mcp", response_model=None)
+@router.post("/mcp/", response_model=None)
+async def mcp_json_rpc(
+    request: Request,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> JSONResponse | Response:
+    try:
+        payload = json.loads((await request.body()).decode("utf-8"))
+    except Exception:
+        log_mcp_rpc_event("parse_error", False, 400)
+        return JSONResponse(
+            _json_rpc_error(None, -32700, "Parse error"),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if isinstance(payload, list):
+        responses = [
+            response
+            for item in payload
+            if (response := _handle_json_rpc_message(item, auth)) is not None
+        ]
+        if not responses:
+            return Response(status_code=status.HTTP_200_OK)
+        return JSONResponse(responses)
+
+    response = _handle_json_rpc_message(payload, auth)
+    if response is None:
+        return Response(status_code=status.HTTP_200_OK)
+    return JSONResponse(response)
