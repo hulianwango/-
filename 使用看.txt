@@ -1,0 +1,2 @@
+使用不了poweer输入这个
+..venvScriptspython.exe run_server.py
