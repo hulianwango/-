@@ -44,6 +44,22 @@ def _deep_get(data: dict[str, Any], dotted_key: str, default: Any) -> Any:
     return current
 
 
+def _first_env(merged_env: dict[str, str], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = merged_env.get(key)
+        if value:
+            return value
+    return default
+
+
+def _first_config(config: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    for key in keys:
+        value = _deep_get(config, key, None)
+        if value not in (None, ""):
+            return value
+    return default
+
+
 def _resolve_path(value: str | os.PathLike[str]) -> Path:
     path = Path(value)
     if path.is_absolute():
@@ -88,6 +104,14 @@ class Settings:
     oauth_code_expires_seconds: int
     chunk_size: int
     chunk_overlap: int
+    translation_provider: str
+    translation_enabled: bool
+    translation_source_language: str
+    translation_target_language: str
+    tencent_translate_secret_id: str
+    tencent_translate_secret_key: str
+    tencent_translate_region: str
+    tencent_translate_project_id: int
 
 
 def load_settings() -> Settings:
@@ -107,6 +131,50 @@ def load_settings() -> Settings:
     )
     logs_dir = merged_env.get("LIT_LOGS_DIR") or _deep_get(
         config, "paths.logs_dir", "logs"
+    )
+    translation_provider = str(
+        merged_env.get("TRANSLATION_PROVIDER")
+        or _deep_get(config, "translation.provider", "tencent")
+    ).strip()
+    tencent_translate_secret_id = str(
+        _first_env(
+            merged_env,
+            "TENCENTCLOUD_SECRET_ID",
+            "TENCENTCLOUD_SECRETID",
+            "TENCENT_SECRET_ID",
+            "TENCENT_SECRETID",
+            "QCLOUD_SECRET_ID",
+            default=str(
+                _first_config(
+                    config,
+                    "translation.tencent.secret_id",
+                    "translation.tencent.secretId",
+                    default="",
+                )
+            ),
+        )
+    ).strip()
+    tencent_translate_secret_key = str(
+        _first_env(
+            merged_env,
+            "TENCENTCLOUD_SECRET_KEY",
+            "TENCENTCLOUD_SECRETKEY",
+            "TENCENT_SECRET_KEY",
+            "TENCENT_SECRETKEY",
+            "QCLOUD_SECRET_KEY",
+            default=str(
+                _first_config(
+                    config,
+                    "translation.tencent.secret_key",
+                    "translation.tencent.secretKey",
+                    default="",
+                )
+            ),
+        )
+    ).strip()
+    translation_enabled = _as_bool(
+        merged_env.get("TRANSLATION_ENABLED"),
+        _as_bool(_deep_get(config, "translation.enabled", True), True),
     )
 
     return Settings(
@@ -153,6 +221,34 @@ def load_settings() -> Settings:
         ),
         chunk_size=int(_deep_get(config, "index.chunk_size", 1800)),
         chunk_overlap=int(_deep_get(config, "index.chunk_overlap", 250)),
+        translation_provider=translation_provider,
+        translation_enabled=translation_enabled,
+        translation_source_language=str(
+            merged_env.get("TRANSLATION_SOURCE_LANGUAGE")
+            or _deep_get(config, "translation.source_language", "en")
+        ).strip()
+        or "en",
+        translation_target_language=str(
+            merged_env.get("TRANSLATION_TARGET_LANGUAGE")
+            or _deep_get(config, "translation.target_language", "zh")
+        ).strip()
+        or "zh",
+        tencent_translate_secret_id=tencent_translate_secret_id,
+        tencent_translate_secret_key=tencent_translate_secret_key,
+        tencent_translate_region=str(
+            _first_env(
+                merged_env,
+                "TENCENTCLOUD_REGION",
+                "TENCENT_REGION",
+                "QCLOUD_REGION",
+                default=str(_deep_get(config, "translation.tencent.region", "ap-guangzhou")),
+            )
+        ).strip()
+        or "ap-guangzhou",
+        tencent_translate_project_id=int(
+            merged_env.get("TENCENTCLOUD_TMT_PROJECT_ID")
+            or _deep_get(config, "translation.tencent.project_id", 0)
+        ),
     )
 
 

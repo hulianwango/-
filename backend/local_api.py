@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -17,6 +17,10 @@ from .auto_classifier import classify_unclassified_papers
 from .database import db_session, utcnow
 from .indexer import scan_papers
 from .mcp_tools import search_papers
+from .overview_translation import (
+    strict_overview_translations,
+    strict_translation_missing_reason,
+)
 from .security import require_local_request, scrub_public_payload
 
 
@@ -30,6 +34,7 @@ UNTAGGED_TAG_FILTER = "__untagged__"
 TAG_MAX_LENGTH = 40
 TAGS_PER_PAPER_MAX = 20
 READ_STATUSES = {"unread", "reading", "read"}
+READING_FILTERS = {*READ_STATUSES, "favorite", "later"}
 
 CHINESE_TERM_MAP = [
     (("upconversion nanoparticle", "upconverting", "ucnp"), "上转换纳米颗粒(UCNPs)"),
@@ -226,6 +231,16 @@ def _clean_reading_state(payload: PaperReadingStateRequest) -> dict[str, Any]:
     }
 
 
+def _clean_reading_filter(reading_filter: str) -> str:
+    clean = str(reading_filter or "").strip()
+    if clean and clean not in READING_FILTERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="reading_filter must be favorite, later, unread, reading, or read.",
+        )
+    return clean
+
+
 def _tags_by_paper_ids(connection, paper_ids: list[str]) -> dict[str, list[str]]:  # type: ignore[no-untyped-def]
     if not paper_ids:
         return {}
@@ -310,6 +325,7 @@ def _paper_matches_filters(
     paper: dict[str, Any],
     category_path: str | None,
     tag: str,
+    reading_filter: str = "",
 ) -> bool:
     if not _paper_matches_category(paper, category_path):
         return False
@@ -318,6 +334,13 @@ def _paper_matches_filters(
         return not paper_tags
     if tag and tag not in paper_tags:
         return False
+    reading_state = paper.get("reading_state") or _default_reading_state()
+    if reading_filter == "favorite":
+        return bool(reading_state.get("is_favorite"))
+    if reading_filter == "later":
+        return bool(reading_state.get("is_later"))
+    if reading_filter in READ_STATUSES:
+        return reading_state.get("read_status") == reading_filter
     return True
 
 
@@ -986,9 +1009,61 @@ def _category_tag_segments(category_path: str) -> list[str]:
     return segments
 
 
+def _classify_imported_papers_background(
+    paper_ids: list[str],
+    duplicate_paths: list[str],
+    duplicate_paper_ids: list[str],
+) -> None:
+    common_options = {
+        "strict": True,
+        "include_classified": True,
+        "include_duplicates": False,
+        "min_auto_score": 8,
+        "review_policy": "best_guess",
+        "duplicate_policy": "duplicate_zone",
+        "rename_policy": "chinese_brief_work",
+    }
+    if paper_ids:
+        classify_unclassified_papers(
+            paper_ids=paper_ids,
+            **common_options,
+        )
+    if duplicate_paths:
+        classify_unclassified_papers(
+            paper_ids=duplicate_paper_ids,
+            source_paths=duplicate_paths,
+            include_paper_paths=False,
+            **common_options,
+        )
+
+
+def _queue_import_classification(
+    background_tasks: BackgroundTasks,
+    paper_ids: list[str],
+    duplicate_paths: list[str],
+    duplicate_paper_ids: list[str],
+) -> None:
+    background_tasks.add_task(
+        _classify_imported_papers_background,
+        list(paper_ids),
+        list(duplicate_paths),
+        list(duplicate_paper_ids),
+    )
+
+
 @router.post("/scan")
-def scan_library() -> dict[str, Any]:
-    return scan_papers()
+def scan_library(background_tasks: BackgroundTasks, fast: bool = True) -> dict[str, Any]:
+    if not fast:
+        return scan_papers()
+    return scan_papers(
+        auto_classify=False,
+        classify_callback=lambda paper_ids, duplicate_paths, duplicate_paper_ids: _queue_import_classification(
+            background_tasks,
+            paper_ids,
+            duplicate_paths,
+            duplicate_paper_ids,
+        ),
+    )
 
 
 @router.post("/auto-classify")
@@ -1244,6 +1319,7 @@ def list_or_search_papers(
     limit: int = LOCAL_LIBRARY_LIMIT,
     category_path: str = ALL_CATEGORIES,
     tag: str = "",
+    reading_filter: str = "",
 ) -> list[dict[str, Any]]:
     query = query.strip()
     limit = max(1, min(int(limit or LOCAL_LIBRARY_LIMIT), LOCAL_LIBRARY_LIMIT_MAX))
@@ -1251,6 +1327,7 @@ def list_or_search_papers(
         None if category_path == ALL_CATEGORIES else paper_files.normalize_category_path(category_path)
     )
     tag_filter = _clean_tag_filter(tag)
+    reading_filter = _clean_reading_filter(reading_filter)
 
     if query:
         records = search_papers(query=query, limit=min(limit, 10))
@@ -1285,7 +1362,7 @@ def list_or_search_papers(
         for record in records:
             detail = details.get(record["paper_id"], {})
             merged = {**detail, **record}
-            if _paper_matches_filters(merged, category_filter, tag_filter):
+            if _paper_matches_filters(merged, category_filter, tag_filter, reading_filter):
                 enriched.append(merged)
         return scrub_public_payload(enriched)
 
@@ -1313,7 +1390,7 @@ def list_or_search_papers(
     papers = [
         paper
         for paper in papers
-        if _paper_matches_filters(paper, category_filter, tag_filter)
+        if _paper_matches_filters(paper, category_filter, tag_filter, reading_filter)
     ]
     return scrub_public_payload(papers[:limit])
 
@@ -1504,8 +1581,9 @@ def get_local_paper_overview(paper_id: str) -> dict[str, Any]:
             """,
             (paper_id, paper_id),
         ).fetchone()
+        reading_state = _reading_states_by_paper_ids(connection, [paper_id]).get(paper_id)
 
-    paper = _paper_public(paper_row)
+    paper = _paper_public(paper_row, reading_state=reading_state)
     page_texts = [row["text"] for row in page_rows[:OVERVIEW_PAGE_LIMIT]]
     if not paper.get("authors") and page_texts:
         paper["authors"] = _guess_authors_from_first_page(page_texts[0], paper.get("title") or "")
@@ -1520,34 +1598,51 @@ def get_local_paper_overview(paper_id: str) -> dict[str, Any]:
         annotation_source = annotation_row["source"]
         annotation_status = annotation_row["status"]
 
-    saved_summary = _summary_from_annotation(annotation)
-    chinese_summary = saved_summary if _has_chinese(saved_summary) else ""
     annotation_points = _points_from_annotation(annotation)
-    annotation_points_zh = [point for point in annotation_points if _has_chinese(point)]
     annotation_points_en = [point for point in annotation_points if not _has_chinese(point)]
 
     source_text = abstract_text or _compact_text("\n".join(page_texts), OVERVIEW_TEXT_LIMIT)
     source_points = _extract_main_points(source_text)
     main_points_en = annotation_points_en or source_points
-    main_points_zh = annotation_points_zh or _auto_chinese_points(main_points_en, paper)
+    overview_en = _auto_english_overview(paper, abstract_text, headings)
+    translation_sources = {
+        "abstract": abstract_text,
+        "overview": overview_en,
+    }
+    for index, point in enumerate(main_points_en):
+        translation_sources[f"main_point:{index}"] = point
+
+    translations, translation_status = strict_overview_translations(
+        paper_id,
+        translation_sources,
+    )
+    translated_abstract = translations.get("abstract", "")
+    translated_overview = translations.get("overview", "")
+    main_points_zh = [
+        translations.get(f"main_point:{index}", "") for index in range(len(main_points_en))
+    ]
+    missing_chinese_reason = strict_translation_missing_reason(translation_status)
+    chinese_summary = translated_abstract
 
     return scrub_public_payload(
         {
             **paper,
-            "has_chinese_summary": bool(chinese_summary),
-            "chinese_summary": chinese_summary,
-            "auto_chinese_abstract": _auto_chinese_abstract(
-                paper, abstract_text, headings, main_points_zh
-            ),
+            "has_chinese_summary": bool(translated_abstract),
+            "chinese_summary": translated_abstract,
+            "translated_chinese_abstract": translated_abstract,
+            "auto_chinese_abstract": translated_abstract,
             "summary_source": annotation_source,
             "summary_status": annotation_status,
             "missing_chinese_reason": ""
-            if chinese_summary
-            else "数据库目前只有 PDF 原文索引，还没有为这篇文献保存待审或已接受的 AI 中文摘要草稿。",
-            "auto_chinese_overview": _auto_chinese_overview(paper, abstract_text, headings),
-            "auto_english_overview": _auto_english_overview(paper, abstract_text, headings),
+            if translated_abstract
+            else missing_chinese_reason,
+            "translation_status": translation_status,
+            "translated_chinese_overview": translated_overview,
+            "auto_chinese_overview": translated_overview,
+            "auto_english_overview": overview_en,
             "abstract_text": abstract_text,
             "main_points": main_points_en,
+            "translated_main_points_zh": main_points_zh,
             "main_points_zh": main_points_zh,
             "main_points_en": main_points_en,
             "section_headings": headings,

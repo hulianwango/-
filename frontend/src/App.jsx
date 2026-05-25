@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Download,
   FileText,
+  Folder,
   FolderInput,
   RefreshCw,
   Save,
@@ -16,6 +17,8 @@ import {
   X,
 } from "lucide-react";
 import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs";
+import { api, isMoveTargetConflict } from "/src/api.js";
+import { buildCategoryTree, splitCategoryPath } from "/src/categoryTree.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs";
@@ -29,6 +32,12 @@ const READ_STATUS_LABELS = {
   reading: "在读",
   read: "已读",
 };
+const READING_FILTER_OPTIONS = [
+  ["", "全部阅读"],
+  ["favorite", "重点阅读"],
+  ["later", "稍后看"],
+  ...Object.entries(READ_STATUS_LABELS),
+];
 
 const RIGHT_PANEL_TABS = [
   ["overview", "概览", BookOpen],
@@ -72,40 +81,6 @@ const SHORT_TEXT_FIELDS = [
   ["au_shape", "Au 形貌"],
   ["er_host", "Er 基质"],
 ];
-
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  const text = await response.text();
-  let payload = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = text;
-    }
-  }
-  if (!response.ok) {
-    const detail = payload?.detail ?? payload;
-    const message =
-      typeof detail === "string" ? detail : detail?.message || text || `HTTP ${response.status}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.detail = detail;
-    throw error;
-  }
-  return payload;
-}
-
-function isMoveTargetConflict(error) {
-  return (
-    error?.status === 409 &&
-    (error.detail?.code === "target_file_exists" ||
-      String(error.message || "").includes("same name already exists"))
-  );
-}
 
 function asEditableValue(value) {
   if (Array.isArray(value) || (value && typeof value === "object")) {
@@ -174,6 +149,11 @@ function categoryTagCandidates(paper) {
   return uniqueTagList(String(decodeEntities(paper?.category_path || "")).split("/"));
 }
 
+function categoryFallbackLabel(categoryPath) {
+  const segments = splitCategoryPath(categoryPath);
+  return decodeEntities(segments[segments.length - 1] || categoryPath || "根目录");
+}
+
 function defaultReadingState() {
   return { read_status: "unread", is_favorite: false, is_later: false };
 }
@@ -203,6 +183,60 @@ function LanguagePanel({ title, children, notice = false, className = "" }) {
   );
 }
 
+function CategoryFolderRow({ node, selected, onOpen }) {
+  return (
+    <button
+      type="button"
+      className={`folderRow ${selected ? "selected" : ""}`}
+      onClick={onOpen}
+      title={node.path || "全部分类"}
+    >
+      <Folder size={17} aria-hidden="true" />
+      <span>
+        <strong>{categoryFallbackLabel(node.label || node.path)}</strong>
+        <small>{node.children.length ? `${node.children.length} 个子文件夹` : "文件夹"}</small>
+      </span>
+      <em>{node.subtree_count || node.paper_count} 篇</em>
+      {node.children.length ? <ChevronRight size={15} aria-hidden="true" /> : null}
+    </button>
+  );
+}
+
+function CategoryBreadcrumb({ currentNode, onBrowse }) {
+  const breadcrumbSegments = splitCategoryPath(currentNode.path);
+
+  return (
+    <div className="categoryExplorerBar">
+      <button
+        type="button"
+        className="categoryBackButton"
+        onClick={() => onBrowse(splitCategoryPath(currentNode.path).slice(0, -1).join("/"))}
+        disabled={!currentNode.path}
+        aria-label="返回上一级分类"
+      >
+        <ChevronLeft size={15} />
+      </button>
+      <div className="categoryBreadcrumb" aria-label="当前分类层级">
+        <button type="button" onClick={() => onBrowse("")}>
+          全部分类
+        </button>
+        {breadcrumbSegments.map((segment, index) => (
+          <React.Fragment key={`${segment}-${index}`}>
+            <span>/</span>
+            {index === breadcrumbSegments.length - 1 ? (
+              <strong>{decodeEntities(segment)}</strong>
+            ) : (
+              <button type="button" onClick={() => onBrowse(breadcrumbSegments.slice(0, index + 1).join("/"))}>
+                {decodeEntities(segment)}
+              </button>
+            )}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PaperList({
   papers,
   categories,
@@ -213,6 +247,8 @@ function PaperList({
   setCategoryFilter,
   tagFilter,
   setTagFilter,
+  readingFilter,
+  setReadingFilter,
   onSearch,
   onScan,
   onClearFilters,
@@ -220,7 +256,56 @@ function PaperList({
   onSelect,
   busy,
 }) {
-  const hasFilters = Boolean(query.trim() || categoryFilter !== ALL_CATEGORIES || tagFilter);
+  const hasFilters = Boolean(query.trim() || categoryFilter !== ALL_CATEGORIES || tagFilter || readingFilter);
+  const [categoryBrowsePath, setCategoryBrowsePath] = useState("");
+  const categoryTree = useMemo(() => buildCategoryTree(categories), [categories]);
+  const currentCategoryNode = categoryTree.nodesByPath.get(categoryBrowsePath) || categoryTree.root;
+  const hasListFilter = Boolean(query.trim() || tagFilter || readingFilter);
+  const browsingFolders =
+    !hasListFilter &&
+    categoryFilter === ALL_CATEGORIES &&
+    currentCategoryNode.children.length > 0;
+  const showPapers = !browsingFolders;
+  const libraryTitle = showPapers
+    ? currentCategoryNode.path && categoryFilter !== ALL_CATEGORIES
+      ? "当前文件夹文献"
+      : hasFilters
+        ? "筛选结果"
+        : "全部文献"
+    : currentCategoryNode.path
+      ? "内部文件夹"
+      : "全部分类";
+
+  useEffect(() => {
+    if (categoryFilter !== ALL_CATEGORIES && categoryTree.nodesByPath.has(categoryFilter)) {
+      setCategoryBrowsePath(categoryFilter);
+    }
+  }, [categoryFilter, categoryTree]);
+
+  useEffect(() => {
+    if (categoryBrowsePath && !categoryTree.nodesByPath.has(categoryBrowsePath)) {
+      setCategoryBrowsePath("");
+    }
+  }, [categoryBrowsePath, categoryTree]);
+
+  const browseCategoryPath = (categoryPath) => {
+    setCategoryBrowsePath(categoryPath);
+    setCategoryFilter(ALL_CATEGORIES);
+  };
+
+  const openCategoryNode = (node) => {
+    setCategoryBrowsePath(node.path);
+    setCategoryFilter(node.children.length ? ALL_CATEGORIES : node.path);
+  };
+
+  const viewCurrentFolderPapers = () => {
+    if (currentCategoryNode.path) setCategoryFilter(currentCategoryNode.path);
+  };
+
+  const clearAllFilters = () => {
+    setCategoryBrowsePath("");
+    onClearFilters();
+  };
 
   return (
     <aside className="sidebar">
@@ -245,19 +330,6 @@ function PaperList({
       </div>
       <div className="filterPanel">
         <select
-          value={categoryFilter}
-          onChange={(event) => setCategoryFilter(event.target.value)}
-          aria-label="按文件夹分类筛选"
-        >
-          <option value={ALL_CATEGORIES}>全部分类</option>
-          {categories.map((category) => (
-            <option key={category.category_path || "__root__"} value={category.category_path}>
-              {decodeEntities(category.category_label || category.category_path || "根目录")}
-              {Number.isFinite(category.paper_count) ? ` (${category.paper_count})` : ""}
-            </option>
-          ))}
-        </select>
-        <select
           value={tagFilter}
           onChange={(event) => setTagFilter(event.target.value)}
           aria-label="按标签筛选"
@@ -271,17 +343,54 @@ function PaperList({
             </option>
           ))}
         </select>
-        <button onClick={onClearFilters} disabled={!hasFilters}>
+        <select
+          value={readingFilter}
+          onChange={(event) => setReadingFilter(event.target.value)}
+          aria-label="按阅读状态筛选"
+        >
+          {READING_FILTER_OPTIONS.map(([value, label]) => (
+            <option key={value || "__all_reading__"} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={clearAllFilters}
+          disabled={!hasFilters}
+        >
           <X size={15} />
           清除
         </button>
       </div>
+      <CategoryBreadcrumb currentNode={currentCategoryNode} onBrowse={browseCategoryPath} />
       <div className="libraryMeta">
-        <strong>{hasFilters ? "筛选结果" : "全部文献"}</strong>
-        <span>{papers.length} 篇</span>
+        <strong>{libraryTitle}</strong>
+        <span>{showPapers ? `${papers.length} 篇` : `${currentCategoryNode.children.length} 个文件夹`}</span>
       </div>
       <div className="paperList">
-        {papers.map((paper) => {
+        {!showPapers ? (
+          <>
+            {currentCategoryNode.path && currentCategoryNode.paper_count > 0 ? (
+              <button type="button" className="currentFolderRow" onClick={viewCurrentFolderPapers}>
+                <FileText size={17} aria-hidden="true" />
+                <span>
+                  <strong>查看当前文件夹文献</strong>
+                  <small>{categoryFallbackLabel(currentCategoryNode.label || currentCategoryNode.path)}</small>
+                </span>
+                <em>{currentCategoryNode.paper_count} 篇</em>
+              </button>
+            ) : null}
+            {currentCategoryNode.children.map((child) => (
+              <CategoryFolderRow
+                key={child.path}
+                node={child}
+                selected={categoryFilter === child.path}
+                onOpen={() => openCategoryNode(child)}
+              />
+            ))}
+          </>
+        ) : null}
+        {showPapers && papers.map((paper) => {
           const title = decodeEntities(paper.title || "Untitled");
           const paperTags = normalizedList(paper.tags);
           const readingState = normalizeReadingState(paper.reading_state);
@@ -312,6 +421,9 @@ function PaperList({
             </button>
           );
         })}
+        {showPapers && !papers.length ? (
+          <div className="emptyState">当前条件下没有文献</div>
+        ) : null}
       </div>
     </aside>
   );
@@ -576,16 +688,14 @@ function PaperOverview({ paper, overview, loading, error }) {
   const doi = decodeEntities(overview?.doi || paper.doi || "");
   const pageCount = overview?.page_count ?? paper.page_count;
   const abstractEn = decodeEntities(overview?.abstract_text || "");
-  const overviewZh = decodeEntities(overview?.auto_chinese_overview || "");
+  const overviewZh = decodeEntities(overview?.translated_chinese_overview || "");
   const overviewEn = decodeEntities(overview?.auto_english_overview || abstractEn);
-  const summaryZh = decodeEntities(
-    overview?.has_chinese_summary
-      ? overview.chinese_summary
-      : overview?.auto_chinese_abstract || overview?.auto_chinese_overview || "",
-  );
+  const summaryZh = decodeEntities(overview?.translated_chinese_abstract || "");
   const summaryZhMissing =
-    overview?.missing_chinese_reason || "这篇文献还没有保存中文摘要，也暂时无法生成自动中文摘要。";
-  const mainPointsZh = normalizedList(overview?.main_points_zh);
+    overview?.missing_chinese_reason || "腾讯云翻译还未生成中文摘要。";
+  const overviewZhMissing =
+    overview?.missing_chinese_reason || "腾讯云翻译还未生成中文概览。";
+  const mainPointsZh = normalizedList(overview?.translated_main_points_zh);
   const mainPointsEn = normalizedList(overview?.main_points_en || overview?.main_points);
   const mainPointCount = Math.max(mainPointsZh.length, mainPointsEn.length);
   const pairedMainPoints = Array.from({ length: mainPointCount }, (_, index) => ({
@@ -660,7 +770,7 @@ function PaperOverview({ paper, overview, loading, error }) {
             </h3>
             <div className="languagePair">
               <LanguagePanel title="中文" notice={!overviewZh}>
-                {overviewZh || "暂时没有自动中文概览。"}
+                {overviewZh || overviewZhMissing}
               </LanguagePanel>
               <LanguagePanel title="English" notice={!overviewEn} className="originalText">
                 {overviewEn || "No English overview is available."}
@@ -681,6 +791,11 @@ function PaperOverview({ paper, overview, loading, error }) {
                     <div className="pointLanguage">
                       <strong>中文</strong>
                       <p>{point.zh}</p>
+                    </div>
+                  ) : point.en ? (
+                    <div className="pointLanguage notice">
+                      <strong>中文</strong>
+                      <p>腾讯云翻译未生成此要点中文。</p>
                     </div>
                   ) : null}
                   {point.en ? (
@@ -1333,6 +1448,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState(ALL_CATEGORIES);
   const [tagFilter, setTagFilter] = useState("");
+  const [readingFilter, setReadingFilter] = useState("");
   const [selectedPaper, setSelectedPaper] = useState(null);
   const [selectedPaperTags, setSelectedPaperTags] = useState([]);
   const [selectedReadingState, setSelectedReadingState] = useState(defaultReadingState());
@@ -1381,6 +1497,7 @@ function App() {
     if (trimmedQuery) params.set("query", trimmedQuery);
     if (categoryFilter !== ALL_CATEGORIES) params.set("category_path", categoryFilter);
     if (tagFilter) params.set("tag", tagFilter);
+    if (readingFilter) params.set("reading_filter", readingFilter);
     const loaded = await api(`/local/papers?${params.toString()}`);
     setPapers(loaded);
     setSelectedPaper((current) => {
@@ -1409,9 +1526,10 @@ function App() {
           JSON.stringify(nextPaper.reading_state || {}) === JSON.stringify(current.reading_state || {});
         return unchanged ? current : nextPaper;
       }
-      return loaded[0] || null;
+      return current || loaded[0] || null;
     });
-  }, [categoryFilter, query, tagFilter]);
+    return loaded;
+  }, [categoryFilter, query, readingFilter, tagFilter]);
 
   const loadDrafts = useCallback(async () => {
     setDrafts(await api("/local/drafts"));
@@ -1493,7 +1611,17 @@ function App() {
     setOverviewError("");
     api(`/local/papers/${selectedPaper.paper_id}/overview`)
       .then((result) => {
-        if (!cancelled) setOverview(result);
+        if (cancelled) return;
+        setOverview(result);
+        if (result?.reading_state) {
+          const loadedReadingState = normalizeReadingState(result.reading_state);
+          setSelectedReadingState(loadedReadingState);
+          setSelectedPaper((current) =>
+            current?.paper_id === result.paper_id
+              ? { ...current, reading_state: loadedReadingState }
+              : current,
+          );
+        }
       })
       .catch((error) => {
         if (!cancelled) {
@@ -1509,6 +1637,12 @@ function App() {
       cancelled = true;
     };
   }, [selectedPaper?.paper_id, activeRightPanel]);
+
+  useEffect(() => {
+    if (selectedPaper?.paper_id) {
+      setSelectedReadingState(normalizeReadingState(selectedPaper.reading_state));
+    }
+  }, [selectedPaper?.paper_id, selectedPaper?.reading_state]);
 
   useEffect(() => {
     if (!selectedPaper?.paper_id) {
@@ -1548,23 +1682,49 @@ function App() {
     setQuery("");
     setCategoryFilter(ALL_CATEGORIES);
     setTagFilter("");
+    setReadingFilter("");
+  };
+
+  const refreshLibraryViews = async () => {
+    const refreshedPapers = await loadPapers();
+    await loadCategories();
+    await loadTags();
+    if (activeRightPanel === "details") await loadTagSuggestions();
+    if (activeRightPanel === "quality") await loadQualityReport();
+    if (activeRightPanel === "organize") await loadEmptyCategories();
+    return refreshedPapers;
+  };
+
+  const refreshedListNotice = (refreshedPapers) => {
+    const visibleCount = Array.isArray(refreshedPapers) ? refreshedPapers.length : papers.length;
+    const scope =
+      query.trim() || categoryFilter !== ALL_CATEGORIES || tagFilter || readingFilter
+        ? "当前筛选列表"
+        : "论文列表";
+    return `网页已刷新，${scope}显示 ${visibleCount} 篇`;
   };
 
   const scan = async () => {
     setBusy(true);
-    setNotice("");
+    setNotice("正在快速扫描导入，自动分类会在后台继续...");
     try {
-      const result = await api("/local/scan", { method: "POST" });
-      const autoClassified = result.auto_classified || result.classification?.moved || 0;
+      const result = await api("/local/scan?fast=true", { method: "POST" });
+      const autoClassified = result.auto_classified ?? result.classification?.moved ?? 0;
+      const autoClassifyFailed = result.auto_classify_failed ?? result.classification?.failed ?? 0;
+      const autoClassifyPending = result.auto_classify_pending ?? 0;
+      const refreshedPapers = await refreshLibraryViews();
       setNotice(
-        `扫描 ${result.scanned}，入库 ${result.indexed}，跳过 ${result.skipped || 0}，失败 ${result.failed}，自动分类 ${autoClassified}`,
+        `导入完成：扫描 ${result.scanned ?? 0}，入库 ${result.indexed ?? 0}，跳过 ${
+          result.skipped || 0
+        }，失败 ${result.failed ?? 0}，自动分类 ${autoClassified}${
+          autoClassifyFailed ? `，分类失败 ${autoClassifyFailed}` : ""
+        }${autoClassifyPending ? `，后台识别 ${autoClassifyPending} 篇` : ""}；${refreshedListNotice(refreshedPapers)}`,
       );
-      await loadPapers();
-      await loadCategories();
-      await loadTags();
-      if (activeRightPanel === "details") await loadTagSuggestions();
-      if (activeRightPanel === "quality") await loadQualityReport();
-      if (activeRightPanel === "organize") await loadEmptyCategories();
+      if (autoClassifyPending) {
+        window.setTimeout(() => {
+          refreshLibraryViews().catch((error) => setNotice(error.message));
+        }, 2500);
+      }
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -1574,7 +1734,7 @@ function App() {
 
   const autoClassifyPapers = async ({ dryRun = false } = {}) => {
     setAutoClassifying(true);
-    setNotice("");
+    setNotice(dryRun ? "正在预览严格分类，请稍候..." : "正在执行严格分类并刷新网页，请稍候...");
     try {
       const result = await api("/local/auto-classify", {
         method: "POST",
@@ -1592,20 +1752,17 @@ function App() {
         }),
       });
       setAutoClassifyResult(result);
+      let refreshedPapers = null;
       if (!dryRun) {
-        await loadPapers();
-        await loadCategories();
-        await loadTags();
-        if (activeRightPanel === "details") await loadTagSuggestions();
-        if (activeRightPanel === "quality") await loadQualityReport();
-        if (activeRightPanel === "organize") await loadEmptyCategories();
+        refreshedPapers = await refreshLibraryViews();
       }
+      const actionCount = dryRun ? result.planned || 0 : result.moved || result.planned || 0;
       setNotice(
-        `${dryRun ? "严格分类预览" : "严格分类"}：可移动 ${result.planned || result.moved || 0}，待确认 ${
+        `${dryRun ? "严格分类预览完成" : "严格分类完成"}：${dryRun ? "可移动" : "已移动"} ${actionCount}，待确认 ${
           result.skipped_review || 0
         }，改名 ${result.renamed || 0}，重复 PDF ${result.duplicate_file_count || 0}，冲突 ${
           result.conflicts || 0
-        }，失败 ${result.failed || 0}`,
+        }，失败 ${result.failed || 0}${dryRun ? "" : `；${refreshedListNotice(refreshedPapers)}`}`,
       );
     } catch (error) {
       setNotice(error.message);
@@ -1625,7 +1782,10 @@ function App() {
       if (tagFilter) {
         params.set("tag", tagFilter);
       }
-      if (query.trim() || categoryFilter !== ALL_CATEGORIES || tagFilter) {
+      if (readingFilter) {
+        params.set("reading_filter", readingFilter);
+      }
+      if (query.trim() || categoryFilter !== ALL_CATEGORIES || tagFilter || readingFilter) {
         const visibleIds = papers.map((paper) => paper.paper_id).filter(Boolean);
         if (visibleIds.length) {
           params.set("paper_ids", visibleIds.join(","));
@@ -1899,6 +2059,8 @@ function App() {
         setCategoryFilter={setCategoryFilter}
         tagFilter={tagFilter}
         setTagFilter={setTagFilter}
+        readingFilter={readingFilter}
+        setReadingFilter={setReadingFilter}
         onSearch={() => loadPapers().catch((error) => setNotice(error.message))}
         onScan={scan}
         onClearFilters={clearFilters}
@@ -2026,7 +2188,11 @@ function App() {
           ) : null}
         </div>
       </section>
-      {notice ? <div className="toast">{notice}</div> : null}
+      {notice ? (
+        <div className="toast" role="status" aria-live="polite">
+          {notice}
+        </div>
+      ) : null}
     </div>
   );
 }

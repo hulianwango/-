@@ -139,12 +139,41 @@ CREATE TABLE IF NOT EXISTS paper_reading_states (
     FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS paper_overview_translations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    target_language TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    translated_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (paper_id, source_key, source_hash, target_language),
+    FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS paper_file_scans (
+    file_path TEXT PRIMARY KEY,
+    paper_id TEXT NOT NULL,
+    file_hash TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    file_mtime_ns INTEGER NOT NULL,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_paper_chunks_paper_id ON paper_chunks(paper_id);
 CREATE INDEX IF NOT EXISTS idx_paper_ai_drafts_paper_id ON paper_ai_drafts(paper_id);
 CREATE INDEX IF NOT EXISTS idx_paper_ai_drafts_status ON paper_ai_drafts(status);
 CREATE INDEX IF NOT EXISTS idx_paper_tags_tag ON paper_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_paper_reading_states_status
 ON paper_reading_states(read_status, is_favorite, is_later);
+CREATE INDEX IF NOT EXISTS idx_paper_overview_translations_lookup
+ON paper_overview_translations(paper_id, source_key, source_hash, target_language);
+CREATE INDEX IF NOT EXISTS idx_paper_file_scans_paper_id
+ON paper_file_scans(paper_id);
 """
 
 

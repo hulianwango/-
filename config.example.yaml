@@ -26,3 +26,14 @@ oauth:
 index:
   chunk_size: 1800
   chunk_overlap: 250
+
+translation:
+  provider: "tencent"
+  enabled: true
+  source_language: "en"
+  target_language: "zh"
+  tencent:
+    secret_id: ""
+    secret_key: ""
+    region: "ap-guangzhou"
+    project_id: 0

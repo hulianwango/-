@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import fitz
 
@@ -192,6 +192,111 @@ def _chunk_rows_are_current(connection: sqlite3.Connection, paper_id: str) -> bo
     return chunks == fts_chunks
 
 
+def _upsert_file_scan_cache(
+    connection: sqlite3.Connection,
+    *,
+    path: Path,
+    paper_id: str,
+    file_hash: str,
+    page_count: int,
+) -> None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return
+    connection.execute(
+        """
+        INSERT INTO paper_file_scans (
+            file_path, paper_id, file_hash, file_size, file_mtime_ns, page_count, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file_path) DO UPDATE SET
+            paper_id = excluded.paper_id,
+            file_hash = excluded.file_hash,
+            file_size = excluded.file_size,
+            file_mtime_ns = excluded.file_mtime_ns,
+            page_count = excluded.page_count,
+            updated_at = excluded.updated_at
+        """,
+        (
+            str(path),
+            paper_id,
+            file_hash,
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(page_count or 0),
+            utcnow(),
+        ),
+    )
+
+
+def _cached_unchanged_index_status(
+    connection: sqlite3.Connection,
+    path: Path,
+) -> IndexPdfStatus | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    row = connection.execute(
+        """
+        SELECT paper_id, file_hash, file_size, file_mtime_ns, page_count
+        FROM paper_file_scans
+        WHERE file_path = ?
+        """,
+        (str(path),),
+    ).fetchone()
+    if row is None:
+        return None
+    if int(row["file_size"]) != int(stat.st_size):
+        return None
+    if int(row["file_mtime_ns"]) != int(stat.st_mtime_ns):
+        return None
+
+    paper_row = connection.execute(
+        """
+        SELECT paper_id, file_hash, file_path, page_count
+        FROM papers
+        WHERE paper_id = ?
+        """,
+        (row["paper_id"],),
+    ).fetchone()
+    if paper_row is None:
+        return None
+    if paper_row["file_hash"] != row["file_hash"] or paper_row["file_path"] != str(path):
+        return None
+    page_count = int(paper_row["page_count"] or row["page_count"] or 0)
+    if not _page_rows_are_current(connection, paper_row["paper_id"], page_count):
+        return None
+    if not _chunk_rows_are_current(connection, paper_row["paper_id"]):
+        return None
+    return IndexPdfStatus(
+        paper_id=paper_row["paper_id"],
+        indexed=False,
+        status="unchanged_cached",
+    )
+
+
+def _fast_cached_scan_rows(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT s.file_path, s.paper_id, s.file_size, s.file_mtime_ns
+        FROM paper_file_scans s
+        JOIN papers p
+          ON p.paper_id = s.paper_id
+         AND p.file_path = s.file_path
+        """
+    ).fetchall()
+    return {
+        row["file_path"]: {
+            "paper_id": row["paper_id"],
+            "file_size": int(row["file_size"]),
+            "file_mtime_ns": int(row["file_mtime_ns"]),
+        }
+        for row in rows
+    }
+
+
 def _unchanged_index_status(
     connection: sqlite3.Connection,
     *,
@@ -241,6 +346,10 @@ def _unchanged_index_status(
 
 
 def index_pdf_status(connection: sqlite3.Connection, path: Path) -> IndexPdfStatus:
+    cached = _cached_unchanged_index_status(connection, path)
+    if cached is not None:
+        return cached
+
     file_hash = hash_file(path)
     paper_id = paper_id_from_hash(file_hash)
     unchanged = _unchanged_index_status(
@@ -250,6 +359,14 @@ def index_pdf_status(connection: sqlite3.Connection, path: Path) -> IndexPdfStat
         path=path,
     )
     if unchanged is not None:
+        if unchanged.status in {"unchanged", "path_updated"}:
+            _upsert_file_scan_cache(
+                connection,
+                path=path,
+                paper_id=paper_id,
+                file_hash=file_hash,
+                page_count=0,
+            )
         return unchanged
 
     extracted = extract_pdf(path, file_hash=file_hash)
@@ -338,6 +455,13 @@ def index_pdf_status(connection: sqlite3.Connection, path: Path) -> IndexPdfStat
                     chunk,
                 ),
             )
+    _upsert_file_scan_cache(
+        connection,
+        path=path,
+        paper_id=extracted.paper_id,
+        file_hash=extracted.file_hash,
+        page_count=len(extracted.pages),
+    )
     return IndexPdfStatus(paper_id=extracted.paper_id, indexed=True, status="indexed")
 
 
@@ -446,7 +570,10 @@ def _auto_classify_after_index(
         }
 
 
-def scan_papers(auto_classify: bool = True) -> dict[str, Any]:
+def scan_papers(
+    auto_classify: bool = True,
+    classify_callback: Callable[[list[str], list[str], list[str]], None] | None = None,
+) -> dict[str, Any]:
     if not settings.papers_dir.exists():
         return {"scanned": 0, "indexed": 0, "failed": 0, "errors": ["papers_dir_missing"]}
 
@@ -459,14 +586,23 @@ def scan_papers(auto_classify: bool = True) -> dict[str, Any]:
     errors: list[str] = []
 
     with db_session() as connection:
+        fast_cache = _fast_cached_scan_rows(connection)
         for path in pdfs:
             try:
                 stat = path.stat()
+                cached = fast_cache.get(str(path))
+                if (
+                    cached
+                    and int(cached["file_size"]) == int(stat.st_size)
+                    and int(cached["file_mtime_ns"]) == int(stat.st_mtime_ns)
+                ):
+                    skipped += 1
+                    continue
                 is_recent = time.time() - stat.st_mtime < 30
                 if is_recent and not wait_for_stable_pdf(
                     path,
-                    timeout_seconds=10.0,
-                    interval_seconds=0.4,
+                    timeout_seconds=3.0,
+                    interval_seconds=0.2,
                 ):
                     errors.append("file_not_stable")
                     continue
@@ -503,6 +639,9 @@ def scan_papers(auto_classify: bool = True) -> dict[str, Any]:
         result["classification"] = classification
         result["auto_classified"] = classification.get("moved", 0)
         result["auto_classify_failed"] = classification.get("failed", 0)
+    elif classify_callback and (indexed_paper_ids or duplicate_paths):
+        classify_callback(indexed_paper_ids, duplicate_paths, duplicate_paper_ids)
+        result["auto_classify_pending"] = len(indexed_paper_ids) + len(duplicate_paths)
     return result
 
 
