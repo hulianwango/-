@@ -9,6 +9,10 @@ from fastapi import HTTPException, status
 
 from .config import settings
 from .database import db_session, utcnow
+from .paper_files import (
+    list_paper_categories as _list_paper_categories,
+    move_paper_file as _move_paper_file,
+)
 from .security import enforce_public_keys, scrub_public_payload
 
 
@@ -255,3 +259,21 @@ def update_annotation_draft(draft_id: str, annotation_json: dict[str, Any]) -> d
             (json.dumps(clean, ensure_ascii=False), now, draft_id),
         )
     return {"paper_id": row["paper_id"], "draft_id": draft_id, "status": "pending"}
+
+
+def list_paper_categories(include_empty: bool = True) -> list[dict[str, Any]]:
+    return scrub_public_payload(_list_paper_categories(include_empty=include_empty))
+
+
+def move_paper_file(
+    paper_id: str,
+    category_path: str,
+    create_missing_category: bool = True,
+) -> dict[str, Any]:
+    return scrub_public_payload(
+        _move_paper_file(
+            paper_id=paper_id,
+            category_path=category_path,
+            create_missing_category=create_missing_category,
+        )
+    )

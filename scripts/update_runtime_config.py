@@ -41,6 +41,9 @@ def main() -> int:
     parser.add_argument("--bearer-token", default="")
     parser.add_argument("--generate-token", action="store_true")
     parser.add_argument("--keep-token", action="store_true")
+    parser.add_argument("--app-port", type=int, default=0)
+    parser.add_argument("--oauth-username", default="")
+    parser.add_argument("--oauth-password", default="")
     parser.add_argument("--output-json", action="store_true")
     args = parser.parse_args()
 
@@ -49,12 +52,17 @@ def main() -> int:
 
     config_path = args.config.resolve()
     config = _load_config(config_path)
+    app = _section(config, "app")
     mcp = _section(config, "mcp")
     oauth = _section(config, "oauth")
 
     public_base_url = args.public_base_url.rstrip("/")
     if not public_base_url.startswith("https://"):
         raise SystemExit("public base URL must start with https://")
+    if args.app_port:
+        if args.app_port < 1 or args.app_port > 65535:
+            raise SystemExit("app port must be between 1 and 65535")
+        app["port"] = args.app_port
 
     if args.generate_token:
         bearer_token = secrets.token_hex(32)
@@ -66,6 +74,18 @@ def main() -> int:
         bearer_token = str(mcp.get("bearer_token") or "")
 
     oauth["public_base_url"] = public_base_url
+    if args.oauth_username:
+        oauth["username"] = args.oauth_username
+    if args.oauth_password:
+        try:
+            import bcrypt
+        except ImportError as exc:  # pragma: no cover - only hit before dependencies install.
+            raise SystemExit(
+                "bcrypt is not installed. Run: python -m pip install -r requirements.txt"
+            ) from exc
+        oauth["password_hash"] = bcrypt.hashpw(
+            args.oauth_password.encode("utf-8"), bcrypt.gensalt()
+        ).decode("utf-8")
 
     config_text = yaml.safe_dump(
         config,
@@ -78,7 +98,9 @@ def main() -> int:
     result = {
         "config": str(config_path),
         "public_base_url": public_base_url,
+        "app_port": int(app.get("port") or 0),
         "bearer_token": bearer_token,
+        "oauth_username": str(oauth.get("username") or ""),
     }
     if args.output_json:
         print(json.dumps(result, ensure_ascii=False))

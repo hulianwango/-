@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT
 from .database import connect
+from .indexer import start_paper_watch_observer
 from .local_api import router as local_router
 from .mcp_api import router as mcp_router
 from .oauth_api import router as oauth_router
@@ -37,6 +38,16 @@ if ASSETS_DIR.exists():
 def startup() -> None:
     connection = connect()
     connection.close()
+    app.state.paper_watch_observer = start_paper_watch_observer()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    observer = getattr(app.state, "paper_watch_observer", None)
+    if observer is None:
+        return
+    observer.stop()
+    observer.join()
 
 
 @app.get("/health")

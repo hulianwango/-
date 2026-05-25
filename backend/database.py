@@ -129,9 +129,22 @@ CREATE TABLE IF NOT EXISTS paper_tags (
     FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS paper_reading_states (
+    paper_id TEXT PRIMARY KEY,
+    read_status TEXT NOT NULL DEFAULT 'unread',
+    is_favorite INTEGER NOT NULL DEFAULT 0,
+    is_later INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_paper_chunks_paper_id ON paper_chunks(paper_id);
 CREATE INDEX IF NOT EXISTS idx_paper_ai_drafts_paper_id ON paper_ai_drafts(paper_id);
 CREATE INDEX IF NOT EXISTS idx_paper_ai_drafts_status ON paper_ai_drafts(status);
+CREATE INDEX IF NOT EXISTS idx_paper_tags_tag ON paper_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_paper_reading_states_status
+ON paper_reading_states(read_status, is_favorite, is_later);
 """
 
 
@@ -163,4 +176,3 @@ def db_session() -> Iterator[sqlite3.Connection]:
 
 def row_to_dict(row: sqlite3.Row | None) -> dict:
     return dict(row) if row is not None else {}
-

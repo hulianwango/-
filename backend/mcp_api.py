@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 
 from . import mcp_tools
-from .oauth_store import READ_SCOPE, WRITE_DRAFT_SCOPE
+from .oauth_store import MOVE_FILE_SCOPE, READ_SCOPE, WRITE_DRAFT_SCOPE
 from .security import (
     AuthContext,
     log_mcp_event,
@@ -50,6 +50,24 @@ class SaveDraftRequest(BaseModel):
 class UpdateDraftRequest(BaseModel):
     draft_id: str
     annotation_json: dict[str, Any]
+
+
+class ListCategoriesRequest(BaseModel):
+    include_empty: bool = Field(
+        default=True,
+        description="Whether to include existing empty folders under the configured papers folder.",
+    )
+
+
+class MovePaperFileRequest(BaseModel):
+    paper_id: str
+    category_path: str = Field(
+        description="Target folder relative to the configured papers folder. Use an empty string for the root folder."
+    )
+    create_missing_category: bool = Field(
+        default=True,
+        description="Create the target folder inside D:/OneDrive/桌面/论文文件集合 if it does not already exist.",
+    )
 
 
 @dataclass(frozen=True)
@@ -96,6 +114,20 @@ def _call_update_annotation_draft(payload: BaseModel) -> Any:
     )
 
 
+def _call_list_paper_categories(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.list_paper_categories(include_empty=data["include_empty"])
+
+
+def _call_move_paper_file(payload: BaseModel) -> Any:
+    data = payload.model_dump()
+    return mcp_tools.move_paper_file(
+        paper_id=data["paper_id"],
+        category_path=data["category_path"],
+        create_missing_category=data["create_missing_category"],
+    )
+
+
 TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
     "search_papers": ToolDefinition(
         description="Search the private literature database and return limited matching paper snippets.",
@@ -121,6 +153,22 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
         scopes={READ_SCOPE},
         handler=_call_read_page_text,
     ),
+    "list_paper_categories": ToolDefinition(
+        description="List folder categories under the configured papers folder without exposing local paths.",
+        request_model=ListCategoriesRequest,
+        scopes={READ_SCOPE},
+        handler=_call_list_paper_categories,
+    ),
+    "move_paper_file": ToolDefinition(
+        description=(
+            "Move one indexed PDF paper into a relative target folder inside "
+            "D:/OneDrive/桌面/论文文件集合. This never accepts absolute paths, never moves files "
+            "outside that folder, and never overwrites an existing PDF."
+        ),
+        request_model=MovePaperFileRequest,
+        scopes={MOVE_FILE_SCOPE},
+        handler=_call_move_paper_file,
+    ),
     "save_annotation_draft": ToolDefinition(
         description="Save AI-generated paper annotation as a pending draft only. Does not approve or write formal annotations.",
         request_model=SaveDraftRequest,
@@ -139,6 +187,7 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
 def _input_schema(model: type[BaseModel]) -> dict[str, Any]:
     schema = model.model_json_schema()
     schema.pop("title", None)
+    schema.setdefault("required", [])
     return schema
 
 
@@ -315,6 +364,22 @@ def rest_read_page_text(
     auth: AuthContext = Depends(require_mcp_access),
 ) -> Any:
     return call_tool("read_page_text", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/list_paper_categories")
+def rest_list_paper_categories(
+    payload: ListCategoriesRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("list_paper_categories", payload.model_dump(), auth)
+
+
+@router.post("/mcp/tools/move_paper_file")
+def rest_move_paper_file(
+    payload: MovePaperFileRequest,
+    auth: AuthContext = Depends(require_mcp_access),
+) -> Any:
+    return call_tool("move_paper_file", payload.model_dump(), auth)
 
 
 @router.post("/mcp/tools/save_annotation_draft")

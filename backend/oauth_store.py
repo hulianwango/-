@@ -18,7 +18,8 @@ from .config import PROJECT_ROOT, settings
 
 READ_SCOPE = "literature:read"
 WRITE_DRAFT_SCOPE = "literature:write_draft"
-SUPPORTED_SCOPES = [READ_SCOPE, WRITE_DRAFT_SCOPE]
+MOVE_FILE_SCOPE = "literature:move_file"
+SUPPORTED_SCOPES = [READ_SCOPE, WRITE_DRAFT_SCOPE, MOVE_FILE_SCOPE]
 
 OAUTH_DATA_DIR = PROJECT_ROOT / "data"
 CLIENTS_PATH = OAUTH_DATA_DIR / "oauth_clients.json"

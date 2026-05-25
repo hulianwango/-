@@ -54,6 +54,8 @@ python run_server.py
 - `get_paper_metadata(paper_id)`
 - `read_text_chunks(paper_id, chunk_ids)`
 - `read_page_text(paper_id, page_number)`
+- `list_paper_categories(include_empty)`
+- `move_paper_file(paper_id, category_path, create_missing_category)`
 - `save_annotation_draft(paper_id, annotation_json)`
 - `update_annotation_draft(draft_id, annotation_json)`
 
@@ -63,6 +65,7 @@ python run_server.py
 - `read_text_chunks` 每次最多 5 个 chunks。
 - `read_page_text` 每次只读 1 页。
 - 每次返回文本总长度最多 6000 字符。
+- `move_paper_file` 每次只移动 1 篇已入库 PDF，只接受 `D:/OneDrive/桌面/论文文件集合` 内的相对目标目录，不接受绝对路径，不删除文件，不移动到该最大文件夹以外；默认允许在该最大文件夹内创建新的小分类文件夹。
 - `save_annotation_draft` 只写 `paper_ai_drafts`。
 - `update_annotation_draft` 只修改 pending 状态的 `paper_ai_drafts`。
 - 正式 `paper_annotations` 只能由本地网页端接受草稿后写入。

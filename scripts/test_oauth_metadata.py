@@ -235,7 +235,7 @@ def main() -> int:
     _check(status == 401, "unauthenticated /mcp must return HTTP 401")
     _check("resource_metadata=" in www_authenticate, "WWW-Authenticate must include resource_metadata")
     _check(
-        'scope="literature:read literature:write_draft"' in www_authenticate,
+        'scope="literature:read literature:write_draft literature:move_file"' in www_authenticate,
         "WWW-Authenticate must include MCP OAuth scopes",
     )
     _check(

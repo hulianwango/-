@@ -8,10 +8,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
+from . import paper_files
+from .auto_classifier import classify_unclassified_papers
 from .database import db_session, utcnow
 from .indexer import scan_papers
 from .mcp_tools import search_papers
@@ -23,6 +25,11 @@ LOCAL_LIBRARY_LIMIT = 1000
 LOCAL_LIBRARY_LIMIT_MAX = 5000
 OVERVIEW_PAGE_LIMIT = 4
 OVERVIEW_TEXT_LIMIT = 9000
+ALL_CATEGORIES = "__all__"
+UNTAGGED_TAG_FILTER = "__untagged__"
+TAG_MAX_LENGTH = 40
+TAGS_PER_PAPER_MAX = 20
+READ_STATUSES = {"unread", "reading", "read"}
 
 CHINESE_TERM_MAP = [
     (("upconversion nanoparticle", "upconverting", "ucnp"), "上转换纳米颗粒(UCNPs)"),
@@ -65,7 +72,220 @@ class DraftUpdateRequest(BaseModel):
     annotation_json: dict[str, Any]
 
 
-def _paper_public(row) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+class PaperMoveRequest(BaseModel):
+    category_path: str
+    create_missing_category: bool = True
+    overwrite_existing: bool = False
+
+
+class PaperTagsRequest(BaseModel):
+    tags: list[str]
+
+
+class PaperMetadataRequest(BaseModel):
+    title: str
+    authors: str = ""
+    year: int | None = None
+    journal: str = ""
+    doi: str = ""
+
+
+class PaperReadingStateRequest(BaseModel):
+    read_status: str = "unread"
+    is_favorite: bool = False
+    is_later: bool = False
+
+
+class AutoClassifyRequest(BaseModel):
+    dry_run: bool = False
+    limit: int | None = None
+    include_classified: bool = True
+    include_duplicates: bool = True
+    min_auto_score: int = 8
+    strict: bool = True
+    hierarchy_order: str = "mechanism/material_structure/application"
+    target_prefix: str = ""
+    review_policy: str = "review"
+    duplicate_policy: str = "classify"
+    rename_policy: str = "original"
+
+
+class EmptyCategoryDeleteRequest(BaseModel):
+    category_path: str
+
+
+def _row_has(row, key: str) -> bool:  # type: ignore[no-untyped-def]
+    return key in row.keys()
+
+
+def _clean_tag(raw_tag: str) -> str:
+    tag = re.sub(r"\s+", " ", str(raw_tag or "")).strip()
+    if not tag:
+        return ""
+    if tag == UNTAGGED_TAG_FILTER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tag value is reserved for filtering.",
+        )
+    if len(tag) > TAG_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"tag must be at most {TAG_MAX_LENGTH} characters.",
+        )
+    if any(char in tag for char in "\r\n\t,"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tag cannot contain commas or line breaks.",
+        )
+    return tag
+
+
+def _clean_tag_filter(raw_tag: str) -> str:
+    tag = str(raw_tag or "").strip()
+    if tag == UNTAGGED_TAG_FILTER:
+        return tag
+    return _clean_tag(tag) if tag else ""
+
+
+def _clean_tags(raw_tags: list[str]) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in raw_tags:
+        tag = _clean_tag(raw_tag)
+        if not tag:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+        if len(tags) > TAGS_PER_PAPER_MAX:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"each paper can have at most {TAGS_PER_PAPER_MAX} tags.",
+            )
+    return tags
+
+
+def _clean_recommended_tags(raw_tags: list[Any]) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in raw_tags:
+        if not isinstance(raw_tag, str):
+            continue
+        try:
+            tag = _clean_tag(raw_tag)
+        except HTTPException:
+            continue
+        if not tag:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+        if len(tags) >= TAGS_PER_PAPER_MAX:
+            break
+    return tags
+
+
+def _clean_paper_metadata(payload: PaperMetadataRequest) -> dict[str, Any]:
+    title = html.unescape(payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="title is required.")
+    year = payload.year
+    if year is not None and not 1500 <= int(year) <= 2100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="year must be between 1500 and 2100.",
+        )
+    return {
+        "title": title,
+        "authors": html.unescape(payload.authors or "").strip(),
+        "year": year,
+        "journal": html.unescape(payload.journal or "").strip(),
+        "doi": html.unescape(payload.doi or "").strip(),
+    }
+
+
+def _default_reading_state() -> dict[str, Any]:
+    return {"read_status": "unread", "is_favorite": False, "is_later": False}
+
+
+def _clean_reading_state(payload: PaperReadingStateRequest) -> dict[str, Any]:
+    read_status = (payload.read_status or "unread").strip()
+    if read_status not in READ_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="read_status must be unread, reading, or read.",
+        )
+    return {
+        "read_status": read_status,
+        "is_favorite": bool(payload.is_favorite),
+        "is_later": bool(payload.is_later),
+    }
+
+
+def _tags_by_paper_ids(connection, paper_ids: list[str]) -> dict[str, list[str]]:  # type: ignore[no-untyped-def]
+    if not paper_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(paper_ids))
+    placeholders = ",".join("?" for _ in unique_ids)
+    rows = connection.execute(
+        f"""
+        SELECT paper_id, tag
+        FROM paper_tags
+        WHERE paper_id IN ({placeholders})
+        ORDER BY lower(tag), tag
+        """,
+        tuple(unique_ids),
+    ).fetchall()
+    tags: dict[str, list[str]] = {paper_id: [] for paper_id in unique_ids}
+    for row in rows:
+        tags.setdefault(row["paper_id"], []).append(row["tag"])
+    return tags
+
+
+def _reading_states_by_paper_ids(
+    connection,
+    paper_ids: list[str],
+) -> dict[str, dict[str, Any]]:  # type: ignore[no-untyped-def]
+    if not paper_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(paper_ids))
+    placeholders = ",".join("?" for _ in unique_ids)
+    rows = connection.execute(
+        f"""
+        SELECT paper_id, read_status, is_favorite, is_later
+        FROM paper_reading_states
+        WHERE paper_id IN ({placeholders})
+        """,
+        tuple(unique_ids),
+    ).fetchall()
+    states = {paper_id: _default_reading_state() for paper_id in unique_ids}
+    for row in rows:
+        states[row["paper_id"]] = {
+            "read_status": row["read_status"],
+            "is_favorite": bool(row["is_favorite"]),
+            "is_later": bool(row["is_later"]),
+        }
+    return states
+
+
+def _paper_exists(connection, paper_id: str) -> bool:  # type: ignore[no-untyped-def]
+    row = connection.execute(
+        "SELECT 1 FROM papers WHERE paper_id = ? LIMIT 1",
+        (paper_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _paper_public(
+    row,
+    tags: list[str] | None = None,
+    reading_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    file_path = row["file_path"] if _row_has(row, "file_path") else ""
     return {
         "paper_id": row["paper_id"],
         "title": html.unescape(row["title"] or ""),
@@ -73,8 +293,210 @@ def _paper_public(row) -> dict[str, Any]:  # type: ignore[no-untyped-def]
         "year": row["year"],
         "journal": html.unescape(row["journal"] or ""),
         "doi": html.unescape(row["doi"] or ""),
-        "page_count": row["page_count"] if "page_count" in row.keys() else None,
+        "page_count": row["page_count"] if _row_has(row, "page_count") else None,
+        "imported_at": row["created_at"] if _row_has(row, "created_at") else "",
+        "updated_at": row["updated_at"] if _row_has(row, "updated_at") else "",
+        "tags": tags or [],
+        "reading_state": reading_state or _default_reading_state(),
+        **paper_files.paper_category_fields(file_path),
     }
+
+
+def _paper_matches_category(paper: dict[str, Any], category_path: str | None) -> bool:
+    return category_path is None or paper.get("category_path", "") == category_path
+
+
+def _paper_matches_filters(
+    paper: dict[str, Any],
+    category_path: str | None,
+    tag: str,
+) -> bool:
+    if not _paper_matches_category(paper, category_path):
+        return False
+    paper_tags = paper.get("tags") or []
+    if tag == UNTAGGED_TAG_FILTER:
+        return not paper_tags
+    if tag and tag not in paper_tags:
+        return False
+    return True
+
+
+def _reference_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _split_reference_authors(authors: str) -> list[str]:
+    text = _reference_text(authors)
+    if not text:
+        return []
+    parts = re.split(r"\s*(?:;|；|\band\b|&)\s*", text)
+    parts = [_reference_text(part) for part in parts if _reference_text(part)]
+    return parts or [text]
+
+
+def _bibtex_escape(value: Any) -> str:
+    text = _reference_text(value)
+    return text.replace("\\", "\\textbackslash{}").replace("{", "\\{").replace("}", "\\}")
+
+
+def _ascii_words(value: Any) -> list[str]:
+    normalized = unicodedata.normalize("NFKD", _reference_text(value))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.findall(r"[A-Za-z0-9]+", ascii_text)
+
+
+def _citation_key(paper: dict[str, Any], used: set[str]) -> str:
+    authors = _split_reference_authors(paper.get("authors") or "")
+    author_words = _ascii_words(authors[0] if authors else "")
+    title_words = _ascii_words(paper.get("title"))[:3]
+    author = author_words[-1] if author_words else "paper"
+    year = str(paper.get("year") or "nd")
+    base = "".join([author.lower(), year, *(word[:12].lower() for word in title_words)])
+    base = re.sub(r"[^a-z0-9]+", "", base) or f"paper{str(paper.get('paper_id') or '')[:8]}"
+    key = base
+    index = 2
+    while key in used:
+        key = f"{base}{index}"
+        index += 1
+    used.add(key)
+    return key
+
+
+def _reference_rows(
+    *,
+    category_path: str = ALL_CATEGORIES,
+    tag: str = "",
+    paper_ids: str = "",
+) -> list[dict[str, Any]]:
+    requested_ids = [item.strip() for item in str(paper_ids or "").split(",") if item.strip()]
+    category_filter = (
+        None if category_path == ALL_CATEGORIES else paper_files.normalize_category_path(category_path)
+    )
+    tag_filter = _clean_tag_filter(tag)
+
+    where = ""
+    params: tuple[Any, ...] = ()
+    if requested_ids:
+        unique_ids = list(dict.fromkeys(requested_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        where = f"WHERE paper_id IN ({placeholders})"
+        params = tuple(unique_ids)
+
+    with db_session() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                page_count, created_at, updated_at
+            FROM papers
+            {where}
+            ORDER BY authors COLLATE NOCASE, year, title COLLATE NOCASE
+            """,
+            params,
+        ).fetchall()
+        tag_map = _tags_by_paper_ids(connection, [row["paper_id"] for row in rows])
+
+    papers = [
+        _paper_public(
+            row,
+            tags=tag_map.get(row["paper_id"], []),
+        )
+        for row in rows
+    ]
+    return [
+        paper
+        for paper in papers
+        if _paper_matches_filters(paper, category_filter, tag_filter)
+    ]
+
+
+def _format_bibtex_references(papers: list[dict[str, Any]]) -> str:
+    used: set[str] = set()
+    entries: list[str] = []
+    for paper in papers:
+        key = _citation_key(paper, used)
+        fields = {
+            "title": paper.get("title"),
+            "author": " and ".join(_split_reference_authors(paper.get("authors") or "")),
+            "year": paper.get("year"),
+            "journal": paper.get("journal"),
+            "doi": paper.get("doi"),
+        }
+        field_lines = [
+            f"  {name} = {{{_bibtex_escape(value)}}},"
+            for name, value in fields.items()
+            if _reference_text(value)
+        ]
+        entry_type = "article" if _reference_text(paper.get("journal")) else "misc"
+        entries.append("@%s{%s,\n%s\n}" % (entry_type, key, "\n".join(field_lines)))
+    return "\n\n".join(entries) + ("\n" if entries else "")
+
+
+def _format_ris_references(papers: list[dict[str, Any]]) -> str:
+    records: list[str] = []
+    for paper in papers:
+        lines = ["TY  - JOUR" if _reference_text(paper.get("journal")) else "TY  - GEN"]
+        for author in _split_reference_authors(paper.get("authors") or ""):
+            lines.append(f"AU  - {author}")
+        if _reference_text(paper.get("title")):
+            lines.append(f"TI  - {_reference_text(paper.get('title'))}")
+        if _reference_text(paper.get("journal")):
+            lines.append(f"JO  - {_reference_text(paper.get('journal'))}")
+        if paper.get("year"):
+            lines.append(f"PY  - {paper['year']}")
+        if _reference_text(paper.get("doi")):
+            doi = _reference_text(paper.get("doi"))
+            lines.append(f"DO  - {doi}")
+            lines.append(f"UR  - https://doi.org/{doi}")
+        lines.append("ER  -")
+        records.append("\n".join(lines))
+    return "\n\n".join(records) + ("\n" if records else "")
+
+
+def _format_text_references(papers: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, paper in enumerate(papers, start=1):
+        authors = _reference_text(paper.get("authors")) or "Unknown authors"
+        title = _reference_text(paper.get("title")) or "Untitled"
+        journal = _reference_text(paper.get("journal"))
+        year = str(paper.get("year") or "n.d.")
+        doi = _reference_text(paper.get("doi"))
+        citation = f"[{index}] {authors}. {title}"
+        if journal:
+            citation += f"[J]. {journal}, {year}."
+        else:
+            citation += f". {year}."
+        if doi:
+            citation += f" DOI: {doi}."
+        lines.append(citation)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _reference_export_payload(
+    papers: list[dict[str, Any]],
+    export_format: str,
+) -> tuple[str, str, str]:
+    normalized = (export_format or "bibtex").strip().lower()
+    if normalized in {"bib", "bibtex"}:
+        return _format_bibtex_references(papers), "references.bib", "application/x-bibtex; charset=utf-8"
+    if normalized == "ris":
+        return _format_ris_references(papers), "references.ris", "application/x-research-info-systems; charset=utf-8"
+    if normalized in {"txt", "text", "gbt"}:
+        return _format_text_references(papers), "references.txt", "text/plain; charset=utf-8"
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="format must be bibtex, ris, or text.",
+    )
+
+
+def _local_fts_query(query: str) -> str:
+    tokens = re.findall(r"[\w\u4e00-\u9fff-]+", query, flags=re.UNICODE)
+    if not tokens:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="query is required.")
+    return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens[:12])
 
 
 def _repair_pdf_text(text: str) -> str:
@@ -94,6 +516,23 @@ def _compact_text(text: str, limit: int | None = None) -> str:
     if limit and len(text) > limit:
         return text[:limit].rsplit(" ", 1)[0].rstrip() + "..."
     return text
+
+
+def _page_search_snippet(text: str, query: str, limit: int = 280) -> str:
+    compact = _compact_text(text)
+    if not compact:
+        return ""
+    index = compact.casefold().find(query.casefold())
+    if index < 0:
+        return _compact_text(compact, limit)
+    start = max(0, index - limit // 2)
+    end = min(len(compact), index + len(query) + limit // 2)
+    snippet = compact[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(compact):
+        snippet = snippet + "..."
+    return snippet
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -454,29 +893,429 @@ def _auto_chinese_abstract(
     return _auto_chinese_overview(paper, abstract_text, headings)
 
 
+def _draft_from_indexed_text(
+    paper: dict[str, Any],
+    page_rows: list[Any],
+) -> dict[str, Any]:
+    page_texts = [row["text"] for row in page_rows[:OVERVIEW_PAGE_LIMIT]]
+    abstract_text = _extract_original_abstract(page_texts)
+    headings = _extract_section_headings(page_rows)
+    source_text = abstract_text or _compact_text("\n".join(page_texts), OVERVIEW_TEXT_LIMIT)
+    main_points_en = _extract_main_points(source_text)
+    main_points_zh = _auto_chinese_points(main_points_en, paper)
+    summary = _auto_chinese_abstract(paper, abstract_text, headings, main_points_zh)
+    recommended_tags = _detected_chinese_terms(
+        paper.get("title") or "",
+        abstract_text,
+        " ".join(main_points_en),
+    )
+    page_numbers = sorted({item["page_number"] for item in headings[:6]}) or [
+        row["page_number"] for row in page_rows[: min(OVERVIEW_PAGE_LIMIT, len(page_rows))]
+    ]
+    return {
+        "main_work": summary,
+        "material_system": paper.get("title") or "",
+        "methods": "",
+        "key_results": main_points_zh or main_points_en,
+        "mechanisms": "",
+        "evidence": [
+            {"page_number": item["page_number"], "text": item["text"]}
+            for item in headings[:6]
+        ],
+        "page_numbers": page_numbers,
+        "relevance_to_project": "",
+        "recommended_tags": recommended_tags,
+        "limitations": "自动生成的待审草稿，需要结合 PDF 原文核对后再接受。",
+        "mechanism_summary": _auto_chinese_overview(paper, abstract_text, headings),
+        "confidence": 0.45,
+    }
+
+
+def _quality_issue(kind: str, label: str, paper: dict[str, Any], detail: str = "") -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "label": label,
+        "paper_id": paper["paper_id"],
+        "title": paper.get("title") or "Untitled",
+        "detail": detail,
+    }
+
+
+def _merge_tag_suggestion(
+    suggestions: dict[str, dict[str, Any]],
+    *,
+    tag: str,
+    paper_count: int,
+    source: str,
+) -> None:
+    try:
+        clean = _clean_tag(tag)
+    except HTTPException:
+        return
+    if not clean:
+        return
+    key = clean.casefold()
+    existing = suggestions.get(key)
+    if existing is None:
+        suggestions[key] = {"tag": clean, "paper_count": int(paper_count or 0), "source": source}
+        return
+
+    existing["paper_count"] = max(int(existing.get("paper_count") or 0), int(paper_count or 0))
+    sources = str(existing.get("source") or "").split("+")
+    if source not in sources:
+        sources.append(source)
+        existing["source"] = "+".join(source for source in sources if source)
+
+
+def _category_tag_segments(category_path: str) -> list[str]:
+    segments: list[str] = []
+    seen: set[str] = set()
+    for raw_segment in str(category_path or "").split("/"):
+        segment = html.unescape(raw_segment).strip()
+        if not segment:
+            continue
+        try:
+            clean = _clean_tag(segment)
+        except HTTPException:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        segments.append(clean)
+    return segments
+
+
 @router.post("/scan")
 def scan_library() -> dict[str, Any]:
     return scan_papers()
 
 
-@router.get("/papers")
-def list_or_search_papers(query: str = "", limit: int = LOCAL_LIBRARY_LIMIT) -> list[dict[str, Any]]:
-    query = query.strip()
-    if query:
-        return search_papers(query=query, limit=min(limit, 10))
+@router.post("/auto-classify")
+def auto_classify_library(payload: AutoClassifyRequest = AutoClassifyRequest()) -> dict[str, Any]:
+    return scrub_public_payload(
+        classify_unclassified_papers(
+            dry_run=payload.dry_run,
+            limit=payload.limit,
+            include_classified=payload.include_classified,
+            include_duplicates=payload.include_duplicates,
+            min_auto_score=payload.min_auto_score,
+            strict=payload.strict,
+            hierarchy_order=payload.hierarchy_order,
+            target_prefix=payload.target_prefix,
+            review_policy=payload.review_policy,
+            duplicate_policy=payload.duplicate_policy,
+            rename_policy=payload.rename_policy,
+        )
+    )
 
-    limit = max(1, min(limit, LOCAL_LIBRARY_LIMIT_MAX))
+
+@router.get("/references/export")
+def export_local_references(
+    format: str = "bibtex",
+    category_path: str = ALL_CATEGORIES,
+    tag: str = "",
+    paper_ids: str = "",
+) -> Response:
+    papers = _reference_rows(category_path=category_path, tag=tag, paper_ids=paper_ids)
+    content, filename, media_type = _reference_export_payload(papers, format)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/categories")
+def list_local_categories(include_empty: bool = True) -> list[dict[str, Any]]:
+    return scrub_public_payload(paper_files.list_paper_categories(include_empty=include_empty))
+
+
+@router.get("/empty-categories")
+def list_local_empty_categories() -> list[dict[str, Any]]:
+    return scrub_public_payload(paper_files.list_empty_categories())
+
+
+@router.post("/empty-categories/delete")
+def delete_local_empty_category(payload: EmptyCategoryDeleteRequest) -> dict[str, Any]:
+    return scrub_public_payload(paper_files.delete_empty_category(payload.category_path))
+
+
+@router.get("/tags")
+def list_local_tags() -> list[dict[str, Any]]:
     with db_session() as connection:
         rows = connection.execute(
             """
-            SELECT paper_id, title, authors, year, journal, doi, page_count
+            SELECT tag, COUNT(*) AS paper_count
+            FROM paper_tags
+            GROUP BY tag
+            ORDER BY lower(tag), tag
+            """
+        ).fetchall()
+    return scrub_public_payload([dict(row) for row in rows])
+
+
+@router.get("/tag-suggestions")
+def list_local_tag_suggestions(limit: int = 100) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 100), 500))
+    suggestions: dict[str, dict[str, Any]] = {}
+    category_papers: dict[str, set[str]] = {}
+
+    with db_session() as connection:
+        tag_rows = connection.execute(
+            """
+            SELECT tag, COUNT(*) AS paper_count
+            FROM paper_tags
+            GROUP BY tag
+            ORDER BY lower(tag), tag
+            """
+        ).fetchall()
+        paper_rows = connection.execute(
+            """
+            SELECT paper_id, file_path
             FROM papers
             ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
+            """
         ).fetchall()
-    return scrub_public_payload([_paper_public(row) for row in rows])
+
+    for row in tag_rows:
+        _merge_tag_suggestion(
+            suggestions,
+            tag=row["tag"],
+            paper_count=int(row["paper_count"] or 0),
+            source="saved",
+        )
+
+    for row in paper_rows:
+        category_path = paper_files.category_path_for_file(row["file_path"])
+        for tag in _category_tag_segments(category_path):
+            category_papers.setdefault(tag.casefold(), set()).add(row["paper_id"])
+            if tag.casefold() not in suggestions:
+                suggestions[tag.casefold()] = {"tag": tag, "paper_count": 0, "source": "category"}
+
+    for key, paper_ids in category_papers.items():
+        existing = suggestions.get(key)
+        if existing is None:
+            continue
+        existing["paper_count"] = max(int(existing.get("paper_count") or 0), len(paper_ids))
+        sources = str(existing.get("source") or "").split("+")
+        if "category" not in sources:
+            sources.append("category")
+            existing["source"] = "+".join(source for source in sources if source)
+
+    ordered = sorted(
+        suggestions.values(),
+        key=lambda item: (
+            0 if str(item.get("source") or "").startswith("saved") else 1,
+            -int(item.get("paper_count") or 0),
+            str(item.get("tag") or "").casefold(),
+        ),
+    )
+    return scrub_public_payload(ordered[:limit])
+
+
+@router.get("/quality-report")
+def get_local_quality_report() -> dict[str, Any]:
+    with db_session() as connection:
+        paper_rows = connection.execute(
+            """
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                file_hash, page_count, created_at, updated_at
+            FROM papers
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+        draft_rows = connection.execute(
+            """
+            SELECT paper_id, COUNT(*) AS draft_count
+            FROM paper_ai_drafts
+            WHERE status != 'rejected'
+            GROUP BY paper_id
+            """
+        ).fetchall()
+        annotation_rows = connection.execute(
+            """
+            SELECT paper_id, COUNT(*) AS annotation_count
+            FROM paper_annotations
+            GROUP BY paper_id
+            """
+        ).fetchall()
+        duplicate_hash_rows = connection.execute(
+            """
+            SELECT file_hash, COUNT(*) AS duplicate_count
+            FROM papers
+            GROUP BY file_hash
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        tag_rows = connection.execute(
+            """
+            SELECT paper_id, COUNT(*) AS tag_count
+            FROM paper_tags
+            GROUP BY paper_id
+            """
+        ).fetchall()
+
+    draft_counts = {row["paper_id"]: int(row["draft_count"] or 0) for row in draft_rows}
+    annotation_counts = {
+        row["paper_id"]: int(row["annotation_count"] or 0) for row in annotation_rows
+    }
+    duplicate_hashes = {row["file_hash"] for row in duplicate_hash_rows}
+    tag_counts = {row["paper_id"]: int(row["tag_count"] or 0) for row in tag_rows}
+    papers = [_paper_public(row) for row in paper_rows]
+    by_id = {paper["paper_id"]: paper for paper in papers}
+    try:
+        from .library_organizer import organize_library
+
+        duplicate_files = organize_library(
+            dry_run=True,
+            include_duplicates=False,
+            apply_moves=False,
+        ).get("duplicate_files", [])
+    except Exception:
+        duplicate_files = []
+
+    issues: list[dict[str, Any]] = []
+    summary = {
+        "missing_doi": 0,
+        "missing_authors": 0,
+        "missing_year": 0,
+        "future_year": 0,
+        "duplicate_files": 0,
+        "uncategorized": 0,
+        "missing_tags": 0,
+        "no_summary": 0,
+    }
+
+    for row, paper in zip(paper_rows, papers):
+        if not paper.get("doi"):
+            summary["missing_doi"] += 1
+            issues.append(_quality_issue("missing_doi", "缺 DOI", paper))
+        if not paper.get("authors"):
+            summary["missing_authors"] += 1
+            issues.append(_quality_issue("missing_authors", "缺作者", paper))
+        if paper.get("year") is None:
+            summary["missing_year"] += 1
+            issues.append(_quality_issue("missing_year", "缺年份", paper))
+        elif int(paper["year"]) > 2026:
+            summary["future_year"] += 1
+            issues.append(_quality_issue("future_year", "年份异常", paper, str(paper["year"])))
+        if row["file_hash"] in duplicate_hashes:
+            summary["duplicate_files"] += 1
+            issues.append(_quality_issue("duplicate_files", "重复文件", paper))
+        if not paper.get("category_path"):
+            summary["uncategorized"] += 1
+            issues.append(_quality_issue("uncategorized", "未分类", paper))
+        if not tag_counts.get(paper["paper_id"]):
+            summary["missing_tags"] += 1
+            issues.append(_quality_issue("missing_tags", "未打标签", paper))
+        if not draft_counts.get(paper["paper_id"]) and not annotation_counts.get(paper["paper_id"]):
+            summary["no_summary"] += 1
+            issues.append(_quality_issue("no_summary", "未生成摘要", paper))
+
+    for duplicate in duplicate_files:
+        paper = by_id.get(duplicate.get("matches_paper_id"))
+        if paper is None:
+            continue
+        summary["duplicate_files"] += 1
+        issues.append(
+            _quality_issue(
+                "duplicate_files",
+                "重复文件",
+                paper,
+                duplicate.get("source", {}).get("path", ""),
+            )
+        )
+
+    return scrub_public_payload(
+        {
+            "paper_count": len(papers),
+            "summary": summary,
+            "issues": issues[:400],
+            "issue_count": len(issues),
+        }
+    )
+
+
+@router.get("/papers")
+def list_or_search_papers(
+    query: str = "",
+    limit: int = LOCAL_LIBRARY_LIMIT,
+    category_path: str = ALL_CATEGORIES,
+    tag: str = "",
+) -> list[dict[str, Any]]:
+    query = query.strip()
+    limit = max(1, min(int(limit or LOCAL_LIBRARY_LIMIT), LOCAL_LIBRARY_LIMIT_MAX))
+    category_filter = (
+        None if category_path == ALL_CATEGORIES else paper_files.normalize_category_path(category_path)
+    )
+    tag_filter = _clean_tag_filter(tag)
+
+    if query:
+        records = search_papers(query=query, limit=min(limit, 10))
+        paper_ids = [record["paper_id"] for record in records]
+        with db_session() as connection:
+            placeholders = ",".join("?" for _ in paper_ids)
+            detail_rows = (
+                connection.execute(
+                    f"""
+                    SELECT
+                        paper_id, title, authors, year, journal, doi, file_path,
+                        page_count, created_at, updated_at
+                    FROM papers
+                    WHERE paper_id IN ({placeholders})
+                    """,
+                    tuple(paper_ids),
+                ).fetchall()
+                if paper_ids
+                else []
+            )
+            tag_map = _tags_by_paper_ids(connection, paper_ids)
+            reading_map = _reading_states_by_paper_ids(connection, paper_ids)
+        details = {
+            row["paper_id"]: _paper_public(
+                row,
+                tags=tag_map.get(row["paper_id"], []),
+                reading_state=reading_map.get(row["paper_id"]),
+            )
+            for row in detail_rows
+        }
+        enriched = []
+        for record in records:
+            detail = details.get(record["paper_id"], {})
+            merged = {**detail, **record}
+            if _paper_matches_filters(merged, category_filter, tag_filter):
+                enriched.append(merged)
+        return scrub_public_payload(enriched)
+
+    with db_session() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                page_count, created_at, updated_at
+            FROM papers
+            ORDER BY updated_at DESC
+            """,
+        ).fetchall()
+        paper_ids = [row["paper_id"] for row in rows]
+        tag_map = _tags_by_paper_ids(connection, paper_ids)
+        reading_map = _reading_states_by_paper_ids(connection, paper_ids)
+    papers = [
+        _paper_public(
+            row,
+            tags=tag_map.get(row["paper_id"], []),
+            reading_state=reading_map.get(row["paper_id"]),
+        )
+        for row in rows
+    ]
+    papers = [
+        paper
+        for paper in papers
+        if _paper_matches_filters(paper, category_filter, tag_filter)
+    ]
+    return scrub_public_payload(papers[:limit])
 
 
 @router.get("/papers/{paper_id}")
@@ -484,15 +1323,145 @@ def get_local_paper(paper_id: str) -> dict[str, Any]:
     with db_session() as connection:
         row = connection.execute(
             """
-            SELECT paper_id, title, authors, year, journal, doi, page_count
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                page_count, created_at, updated_at
             FROM papers
             WHERE paper_id = ?
             """,
             (paper_id,),
         ).fetchone()
+        tags = _tags_by_paper_ids(connection, [paper_id]).get(paper_id, [])
+        reading_state = _reading_states_by_paper_ids(connection, [paper_id]).get(paper_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
-    return scrub_public_payload(_paper_public(row))
+    return scrub_public_payload(_paper_public(row, tags=tags, reading_state=reading_state))
+
+
+@router.get("/papers/{paper_id}/tags")
+def get_local_paper_tags(paper_id: str) -> dict[str, Any]:
+    with db_session() as connection:
+        if not _paper_exists(connection, paper_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        tags = _tags_by_paper_ids(connection, [paper_id]).get(paper_id, [])
+    return scrub_public_payload({"paper_id": paper_id, "tags": tags})
+
+
+@router.put("/papers/{paper_id}/tags")
+def update_local_paper_tags(paper_id: str, payload: PaperTagsRequest) -> dict[str, Any]:
+    tags = _clean_tags(payload.tags)
+    now = utcnow()
+    with db_session() as connection:
+        if not _paper_exists(connection, paper_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        connection.execute("DELETE FROM paper_tags WHERE paper_id = ?", (paper_id,))
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO paper_tags (paper_id, tag, created_at)
+            VALUES (?, ?, ?)
+            """,
+            [(paper_id, tag_item, now) for tag_item in tags],
+        )
+    return scrub_public_payload({"paper_id": paper_id, "tags": tags})
+
+
+@router.put("/papers/{paper_id}/metadata")
+def update_local_paper_metadata(
+    paper_id: str,
+    payload: PaperMetadataRequest,
+) -> dict[str, Any]:
+    clean = _clean_paper_metadata(payload)
+    now = utcnow()
+    with db_session() as connection:
+        if not _paper_exists(connection, paper_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        connection.execute(
+            """
+            UPDATE papers
+            SET title = ?, authors = ?, year = ?, journal = ?, doi = ?, updated_at = ?
+            WHERE paper_id = ?
+            """,
+            (
+                clean["title"],
+                clean["authors"],
+                clean["year"],
+                clean["journal"],
+                clean["doi"],
+                now,
+                paper_id,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                page_count, created_at, updated_at
+            FROM papers
+            WHERE paper_id = ?
+            """,
+            (paper_id,),
+        ).fetchone()
+        tags = _tags_by_paper_ids(connection, [paper_id]).get(paper_id, [])
+        reading_state = _reading_states_by_paper_ids(connection, [paper_id]).get(paper_id)
+    return scrub_public_payload(_paper_public(row, tags=tags, reading_state=reading_state))
+
+
+@router.get("/papers/{paper_id}/reading-state")
+def get_local_paper_reading_state(paper_id: str) -> dict[str, Any]:
+    with db_session() as connection:
+        if not _paper_exists(connection, paper_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        reading_state = _reading_states_by_paper_ids(connection, [paper_id]).get(
+            paper_id,
+            _default_reading_state(),
+        )
+    return scrub_public_payload({"paper_id": paper_id, **reading_state})
+
+
+@router.put("/papers/{paper_id}/reading-state")
+def update_local_paper_reading_state(
+    paper_id: str,
+    payload: PaperReadingStateRequest,
+) -> dict[str, Any]:
+    reading_state = _clean_reading_state(payload)
+    now = utcnow()
+    with db_session() as connection:
+        if not _paper_exists(connection, paper_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        connection.execute(
+            """
+            INSERT INTO paper_reading_states (
+                paper_id, read_status, is_favorite, is_later, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(paper_id) DO UPDATE SET
+                read_status = excluded.read_status,
+                is_favorite = excluded.is_favorite,
+                is_later = excluded.is_later,
+                updated_at = excluded.updated_at
+            """,
+            (
+                paper_id,
+                reading_state["read_status"],
+                1 if reading_state["is_favorite"] else 0,
+                1 if reading_state["is_later"] else 0,
+                now,
+                now,
+            ),
+        )
+    return scrub_public_payload({"paper_id": paper_id, **reading_state})
+
+
+@router.post("/papers/{paper_id}/move")
+def move_local_paper(paper_id: str, payload: PaperMoveRequest) -> dict[str, Any]:
+    return scrub_public_payload(
+        paper_files.move_paper_file(
+            paper_id=paper_id,
+            category_path=payload.category_path,
+            create_missing_category=payload.create_missing_category,
+            overwrite_existing=payload.overwrite_existing,
+        )
+    )
 
 
 @router.get("/papers/{paper_id}/overview")
@@ -500,7 +1469,9 @@ def get_local_paper_overview(paper_id: str) -> dict[str, Any]:
     with db_session() as connection:
         paper_row = connection.execute(
             """
-            SELECT paper_id, title, authors, year, journal, doi, page_count
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                page_count, created_at, updated_at
             FROM papers
             WHERE paper_id = ?
             """,
@@ -580,6 +1551,99 @@ def get_local_paper_overview(paper_id: str) -> dict[str, Any]:
             "main_points_zh": main_points_zh,
             "main_points_en": main_points_en,
             "section_headings": headings,
+        }
+    )
+
+
+@router.get("/papers/{paper_id}/page-search")
+def search_local_paper_pages(
+    paper_id: str,
+    query: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    query = _compact_text(query)
+    if not query:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="query is required.")
+    limit = max(1, min(int(limit or 20), 50))
+    with db_session() as connection:
+        if not _paper_exists(connection, paper_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        rows = connection.execute(
+            """
+            SELECT page_number, text
+            FROM paper_pages
+            WHERE paper_id = ?
+            ORDER BY page_number
+            """,
+            (paper_id,),
+        ).fetchall()
+
+    results: list[dict[str, Any]] = []
+    query_key = query.casefold()
+    for row in rows:
+        text = row["text"] or ""
+        if query_key not in text.casefold():
+            continue
+        results.append(
+            {
+                "page_number": row["page_number"],
+                "snippet": _page_search_snippet(text, query),
+            }
+        )
+        if len(results) >= limit:
+            break
+    return scrub_public_payload({"paper_id": paper_id, "query": query, "results": results})
+
+
+@router.post("/papers/{paper_id}/drafts/generate")
+def generate_local_paper_draft(paper_id: str) -> dict[str, Any]:
+    now = utcnow()
+    draft_id = f"d_{uuid.uuid4().hex[:20]}"
+    with db_session() as connection:
+        paper_row = connection.execute(
+            """
+            SELECT
+                paper_id, title, authors, year, journal, doi, file_path,
+                page_count, created_at, updated_at
+            FROM papers
+            WHERE paper_id = ?
+            """,
+            (paper_id,),
+        ).fetchone()
+        if paper_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="paper not found.")
+        page_rows = connection.execute(
+            """
+            SELECT page_number, text
+            FROM paper_pages
+            WHERE paper_id = ?
+            ORDER BY page_number
+            """,
+            (paper_id,),
+        ).fetchall()
+        paper = _paper_public(paper_row)
+        annotation = _draft_from_indexed_text(paper, page_rows)
+        connection.execute(
+            """
+            INSERT INTO paper_ai_drafts (
+                draft_id, paper_id, annotation_json, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'pending', ?, ?)
+            """,
+            (draft_id, paper_id, json.dumps(annotation, ensure_ascii=False), now, now),
+        )
+
+    return scrub_public_payload(
+        {
+            "draft_id": draft_id,
+            "paper_id": paper_id,
+            "annotation_json": annotation,
+            "status": "pending",
+            "title": paper["title"],
+            "authors": paper["authors"],
+            "year": paper["year"],
+            "journal": paper["journal"],
+            "doi": paper["doi"],
         }
     )
 
@@ -772,15 +1836,14 @@ def accept_draft(draft_id: str) -> dict[str, Any]:
                 ),
             )
 
-        for tag in annotation.get("recommended_tags") or []:
-            if isinstance(tag, str) and tag.strip():
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO paper_tags (paper_id, tag, created_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (paper_id, tag.strip(), now),
-                )
+        recommended_tags = _clean_recommended_tags(annotation.get("recommended_tags") or [])
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO paper_tags (paper_id, tag, created_at)
+            VALUES (?, ?, ?)
+            """,
+            [(paper_id, tag, now) for tag in recommended_tags],
+        )
 
         connection.execute(
             "UPDATE paper_ai_drafts SET status = 'accepted', updated_at = ? WHERE draft_id = ?",
@@ -814,4 +1877,12 @@ def reject_draft(draft_id: str) -> dict[str, Any]:
 def _bool_int(value: Any) -> int | None:
     if value is None:
         return None
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"", "none", "null", "unknown"}:
+            return None
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return 0
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return 1
     return 1 if bool(value) else 0
